@@ -18,6 +18,12 @@ _SECTION_PATTERNS = {
     "note": re.compile(
         r"###\s*(?:Patze|Gojo)?\s*note\s*\n([\s\S]*?)(?=\n###|\n##\s|\Z)", re.IGNORECASE
     ),
+    "community_consensus": re.compile(
+        r"###\s*(?:Community consensus|Community reaction|Discussion)\s*\n([\s\S]*?)(?=\n###|\n##\s|\Z)", re.IGNORECASE
+    ),
+    "alternative_solutions": re.compile(
+        r"###\s*(?:Alternative solutions|Prior art|Alternatives)\s*\n([\s\S]*?)(?=\n###|\n##\s|\Z)", re.IGNORECASE
+    ),
 }
 
 

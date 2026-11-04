@@ -48,18 +48,40 @@ async def tool_summarize_hn(
     external_id: str,
     summary_type: str = "quick",
     locale: str = "en",
+    include_comments: bool = True,
 ) -> dict[str, Any]:
     """
-    Summarize a Hacker News story by ID using AI with anti-slop guidelines.
+    Summarize a Hacker News story by ID using AI with anti-slop guidelines
+    and optional community discussion synthesis.
     """
     res = await svc.summarize(
         external_id=str(external_id),
         summary_type=summary_type,
         locale=locale,
+        include_comments=include_comments,
     )
     return {
         "artifact": res.artifact.model_dump(mode="json"),
         "completion": res.completion.model_dump(mode="json"),
+    }
+
+
+async def tool_briefing_hn(
+    svc: GojoHNService,
+    *,
+    feed_id: str = "hn_top",
+    limit: int = 10,
+    locale: str = "en",
+) -> dict[str, Any]:
+    """
+    Generate an authoritative executive technology briefing synthesizing top Hacker News stories.
+    """
+    briefing_md = await svc.create_briefing(feed_id=feed_id, limit=limit, locale=locale)
+    return {
+        "feed_id": feed_id,
+        "limit": limit,
+        "locale": locale,
+        "briefing_markdown": briefing_md,
     }
 
 
@@ -168,8 +190,41 @@ HN_AGENT_TOOL_DEFINITIONS = [
                         "default": "en",
                         "description": "Target language ISO code (e.g. 'en', 'th').",
                     },
+                    "include_comments": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Whether to fetch and synthesize community comment discussions.",
+                    },
                 },
                 "required": ["external_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hn_briefing",
+            "description": "Generate a synthesized executive technology briefing from top Hacker News stories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "feed_id": {
+                        "type": "string",
+                        "enum": ["hn_top", "hn_new"],
+                        "default": "hn_top",
+                        "description": "Feed to synthesize.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Number of stories to include.",
+                    },
+                    "locale": {
+                        "type": "string",
+                        "default": "th",
+                        "description": "Target language (e.g. 'th', 'en').",
+                    },
+                },
             },
         },
     },

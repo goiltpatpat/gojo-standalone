@@ -4,7 +4,9 @@ Usage:
     python -m gojo.cli list [--feed top|new] [--page 1]
     python -m gojo.cli search <query>
     python -m gojo.cli get <story_id>
-    python -m gojo.cli summarize <story_id> [--type quick|technical|bullet|thai_concise]
+    python -m gojo.cli summarize <story_id> [--type quick|technical|bullet|thai_concise] [--no-comments]
+    python -m gojo.cli briefing [--limit 10] [--locale th|en]
+    python -m gojo.cli providers
 """
 
 from __future__ import annotations
@@ -12,9 +14,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 from .agent_tools import filter_items_by_query
+from .providers.llm import AutoLLMProvider, OllamaProvider
 from .service import GojoHNService
 
 
@@ -80,13 +84,15 @@ async def _run_cli(args: argparse.Namespace) -> None:
                     print(f"\n{story.get('text')}")
 
         elif args.command == "summarize":
-            print(f"Summarizing story {args.story_id} ({args.type}, locale: {args.locale})...", file=sys.stderr)
+            comments_note = "with comments" if getattr(args, "comments", True) else "no comments"
+            print(f"Summarizing story {args.story_id} ({args.type}, locale: {args.locale}, {comments_note})...", file=sys.stderr)
             res = await svc.summarize(
                 external_id=str(args.story_id),
                 summary_type=args.type,
                 locale=args.locale,
                 model=args.model,
                 force_regenerate=args.force,
+                include_comments=getattr(args, "comments", True),
             )
             if args.json:
                 print(json.dumps(res.model_dump(mode="json"), indent=2, ensure_ascii=False))
@@ -100,8 +106,42 @@ async def _run_cli(args: argparse.Namespace) -> None:
                     for k, v in art.summary_extra.items():
                         print(f"**{k}**: {v}")
 
+        elif args.command == "briefing":
+            feed_id = "hn_new" if args.feed == "new" else "hn_top"
+            print(f"Generating Executive Briefing for {feed_id.upper()} (top {args.limit} stories, locale: {args.locale})...\n", file=sys.stderr)
+            briefing_md = await svc.create_briefing(
+                feed_id=feed_id,
+                limit=args.limit,
+                locale=args.locale,
+                model=args.model,
+            )
+            print(briefing_md)
+
+        elif args.command == "providers":
+            print("--- Gojo LLM Provider Status ---")
+            has_openai = bool(os.getenv("OPENAI_API_KEY"))
+            has_gemini = bool(os.getenv("GEMINI_API_KEY"))
+            print(f"• OpenAI API Key: {'[Configured]' if has_openai else '[Not Set]'}")
+            print(f"• Gemini API Key: {'[Configured]' if has_gemini else '[Not Set]'}")
+
+            ollama = OllamaProvider()
+            ollama_ok = await ollama.is_available()
+            if ollama_ok:
+                models = await ollama.get_available_models()
+                print(f"• Local Ollama: [Active] at {ollama.base_url}")
+                print(f"  Installed models: {', '.join(models)}")
+            else:
+                print(f"• Local Ollama: [Not Running or No Models] ({ollama.base_url})")
+
+            auto = AutoLLMProvider()
+            try:
+                p = await auto.resolve_provider()
+                print(f"\nActive Auto-Selected Provider: \033[1;32m{p.provider_name.upper()}\033[0m")
+            except Exception as e:
+                print(f"\nActive Auto-Selected Provider: \033[1;31mNone ({e})\033[0m")
+
         else:
-            print("Please specify a command: list, search, get, or summarize. Run with --help for details.")
+            print("Please specify a command: list, search, get, summarize, briefing, or providers. Run with --help for details.")
     finally:
         await svc.close()
 
@@ -127,7 +167,7 @@ def main() -> None:
 
     # get
     p_get = subparsers.add_parser("get", help="Get raw story details by ID")
-    p_get.add_argument("story_id", help="Hacker News item ID")
+    p_get.add_argument("story_id", help="Hacker News story ID")
     p_get.add_argument("--json", action="store_true", help="Output raw JSON")
 
     # summarize
@@ -140,9 +180,20 @@ def main() -> None:
         help="Summary style and depth",
     )
     p_sum.add_argument("--locale", default="en", help="Language code (e.g. en, th)")
-    p_sum.add_argument("--model", default=None, help="OpenAI model override")
+    p_sum.add_argument("--model", default=None, help="Model override")
     p_sum.add_argument("--force", action="store_true", help="Force regenerate instead of cache")
+    p_sum.add_argument("--no-comments", dest="comments", action="store_false", default=True, help="Disable community comments")
     p_sum.add_argument("--json", action="store_true", help="Output full JSON response")
+
+    # briefing
+    p_brief = subparsers.add_parser("briefing", help="Generate executive technical briefing for top stories")
+    p_brief.add_argument("--feed", choices=["top", "new"], default="top", help="Feed to synthesize")
+    p_brief.add_argument("--limit", type=int, default=10, help="Number of stories to include (default 10)")
+    p_brief.add_argument("--locale", default="th", help="Language code (e.g. th, en)")
+    p_brief.add_argument("--model", default=None, help="Model override")
+
+    # providers
+    subparsers.add_parser("providers", help="Inspect available LLM providers and models")
 
     args = parser.parse_args()
     if not args.command:

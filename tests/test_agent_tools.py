@@ -34,10 +34,11 @@ def test_filter_items_by_query() -> None:
 
 
 def test_agent_tool_definitions_valid() -> None:
-    assert len(HN_AGENT_TOOL_DEFINITIONS) == 3
+    assert len(HN_AGENT_TOOL_DEFINITIONS) >= 3
     names = [t["function"]["name"] for t in HN_AGENT_TOOL_DEFINITIONS]
     assert "hn_search" in names
     assert "hn_summarize" in names
+    assert "hn_briefing" in names
     assert "hn_get_story" in names
 
 

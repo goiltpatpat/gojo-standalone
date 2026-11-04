@@ -4,6 +4,14 @@ Extracted and refined from patzelife-plugin-agentdiscord.
 """
 
 from .service import GojoHNService
+from .providers.algolia import HackerNewsAlgoliaProvider
+from .providers.llm import (
+    AutoLLMProvider,
+    GeminiProvider,
+    LLMProvider,
+    OllamaProvider,
+    OpenAIProvider,
+)
 from .types import (
     DigestArtifact,
     DigestCompletion,
@@ -16,6 +24,12 @@ from .types import (
 
 __all__ = [
     "GojoHNService",
+    "HackerNewsAlgoliaProvider",
+    "AutoLLMProvider",
+    "LLMProvider",
+    "OpenAIProvider",
+    "GeminiProvider",
+    "OllamaProvider",
     "DigestArtifact",
     "DigestCompletion",
     "DigestFeedItem",

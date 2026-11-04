@@ -1,42 +1,56 @@
 # Gojo Standalone — Hacker News Intelligence Workflow
 
+<p align="center">
+  <img src="assets/gojo_mascot.png" width="280" alt="Gojo Mascot — The Boundless Tech Intelligence Engine" />
+</p>
+
 A self-contained, production-grade Hacker News workflow, summarization engine, and AI agent tool suite. Extracted and distilled from `patzelife-plugin-agentdiscord` into a standalone, modular package.
 
 ---
 
 ## 🌟 Key Features
 
-1. **Hacker News API Provider (`gojo.providers.hn`)**:
+1. **Hacker News API & Algolia Provider (`gojo.providers.hn`, `gojo.providers.algolia`)**:
    - Direct integration with Hacker News official Firebase API (`/v0/topstories.json`, `/v0/newstories.json`, `/v0/item/{id}.json`).
+   - High-performance **Algolia Search API client** fetching complete nested discussion comment trees in a single asynchronous request (eliminates the N+1 query problem).
    - High-throughput asynchronous batch item fetching with concurrency management (`asyncio.gather`).
 
 2. **Security & SSRF Mitigation (`gojo.ssrf`)**:
    - Validates outbound article URLs against private networks (RFC 1918), loopback (`127.0.0.1`, `localhost`), link-local (`169.254.0.0/16`), Carrier-Grade NAT, and IPv6 unroutable addresses before fetching.
 
-3. **Article Extraction & Jina Fallback (`gojo.service`)**:
-   - In-memory HTML parsing prioritizing semantic `<article>` and `<main>` tags while stripping scripts, tracking codes, and noisy boilerplate.
-   - Built-in Jina Reader fallback (`https://r.jina.ai/{url}`) for clean markdown extraction of paywalled or complex SPAs.
+3. **Article Extraction Pipeline (`trafilatura` + Jina Fallback)**:
+   - **Tier 1 (Trafilatura)**: Precision DOM density & text extraction preserving markdown headers, code blocks (`<pre><code>`), and tables while discarding layout boilerplate.
+   - **Tier 2 (Semantic Tag Parsing)**: In-memory fallback prioritizing `<article>` and `<main>` tags.
+   - **Tier 3 (Jina Reader)**: Built-in remote fallback (`https://r.jina.ai/{url}`) for complex SPAs.
 
-4. **Multi-Style AI Summarization (`gojo.prompts`)**:
+4. **Multi-Model Provider Gateway (`gojo.providers.llm`)**:
+   - **OpenAI**: Native support for GPT-4o / GPT-4o-mini via `OPENAI_API_KEY`.
+   - **Google Gemini**: OpenAI-compatible endpoint support via `GEMINI_API_KEY`.
+   - **Offline Local LLM (Ollama)**: Zero-cost offline local inference via `http://localhost:11434` with automatic model discovery and thinking tag stripping (`<think>`).
+   - **Auto-Discovery**: Dynamically routes to the best available provider or local server without crashing.
+
+5. **Multi-Style AI Summarization & Community Synthesis (`gojo.prompts`)**:
    - **`quick`**: Readable, substantive 2–5 paragraph technical brief with names, numbers, and mechanisms.
    - **`technical`**: Deep dive focusing on stack, APIs, CVEs, benchmarks, and architecture.
    - **`bullet`**: Dense, nested scannable bullet points matching source density.
    - **`thai_concise`**: Natural, high-density Thai language summary.
+   - **Community Synthesis**: Synthesizes HN peer reactions, consensus, and alternative tools recommended by commenters.
    - Built-in anti-slop guidelines (bans filler phrases like *"delve"*, *"landscape"*, *"From the title alone"*, *"It is important to note"*).
-   - Structured sections: `## Summary`, `### Why it matters`, `### Key takeaway`, `### Gojo note`.
 
-5. **Deduplication & Deterministic Fingerprinting (`gojo.fingerprint`)**:
+6. **Executive Tech Briefing Mode (`create_briefing`)**:
+   - Holistic synthesis of top stories clustered into thematic categories (*Security & Privacy*, *AI & Models*, *Systems & Embedded*, *Web & Platforms*) with macro-level trend analysis.
+
+7. **Deduplication & Deterministic Fingerprinting (`gojo.fingerprint`)**:
    - SHA-256 fingerprinting: `SHA256("{provider}:{id}:{locale}:{prompt_version}:{type}")`.
    - Guaranteed idempotency: identical requests hit cache without duplicate LLM API costs or token usage.
 
-6. **Pluggable Storage (`gojo.storage`)**:
+8. **Pluggable Storage (`gojo.storage`)**:
    - Zero-dependency **SQLite** storage (`gojo_hn.db`) for standalone local usage.
    - **In-Memory** storage for unit testing and ephemeral runs.
    - Extensible `StorageBackend` abstract class for Redis/Postgres/Supabase.
 
-7. **AI Agent Tool Integrations (`gojo.agent_tools`)**:
-   - Ready-to-use function definitions and schemas compatible with OpenAI Function Calling, Claude/Anthropic Tools, Gemini, LangChain, and Vercel AI SDK.
-   - Built-in Markdown formatters (`format_search_for_agent`, `format_summary_for_agent`) to feed clean context into LLM prompts.
+9. **AI Agent Tool Integrations (`gojo.agent_tools`)**:
+   - Ready-to-use function definitions and schemas compatible with OpenAI Function Calling, Claude/Anthropic Tools, Gemini, LangChain, and Vercel AI SDK (`hn_search`, `hn_summarize`, `hn_get_story`, `hn_briefing`).
 
 ---
 
@@ -120,14 +134,30 @@ python3 -m gojo.cli get 50354960
 
 ### Summarize a Story with AI
 ```bash
-# Quick summary (English)
+# Quick summary with community comments (English)
 python3 -m gojo.cli summarize 50354960 --type quick
 
-# Technical summary in Thai
+# Technical summary in Thai with community synthesis
 python3 -m gojo.cli summarize 50354960 --type thai_concise
 
-# Bullet mode
-python3 -m gojo.cli summarize 50354960 --type bullet
+# Summarize article only without community comments
+python3 -m gojo.cli summarize 50354960 --type quick --no-comments
+```
+
+### Executive Daily Briefing
+Synthesize the top stories on Hacker News into an executive macro-briefing:
+```bash
+# English briefing of top 10 stories
+python3 -m gojo.cli briefing --feed top --limit 10 --locale en
+
+# Thai briefing of top 10 stories
+python3 -m gojo.cli briefing --feed top --limit 10 --locale th
+```
+
+### Inspect LLM Providers
+Check status of configured cloud keys and local Ollama daemon:
+```bash
+python3 -m gojo.cli providers
 ```
 
 ---

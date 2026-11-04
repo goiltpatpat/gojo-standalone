@@ -1,7 +1,8 @@
 """
 GojoHNService: Main orchestration engine for Hacker News feed fetching,
-SSRF-safe article content extraction, AI summarization, fingerprint deduplication,
-and persistent caching.
+SSRF-safe article content extraction with Trafilatura and Jina fallback,
+community discussion synthesis via Algolia, multi-model AI summarization,
+fingerprint deduplication, and persistent caching.
 """
 
 from __future__ import annotations
@@ -19,13 +20,20 @@ import httpx
 from .fingerprint import digest_fingerprint
 from .interpretation import extract_summary_extra_from_markdown
 from .prompts import (
+    build_briefing_system_prompt,
     build_digest_system_prompt,
     build_digest_user_message,
     effective_locale_for_summary,
     normalize_summary_type,
 )
+from .providers.algolia import HackerNewsAlgoliaProvider
 from .providers.base import FeedSource
 from .providers.hn import HackerNewsFeedSource
+from .providers.llm import (
+    AutoLLMProvider,
+    LLMProvider,
+    OpenAIProvider,
+)
 from .ssrf import is_public_http_url_for_fetch
 from .storage.base import StorageBackend
 from .storage.sqlite import SQLiteStorage
@@ -67,25 +75,35 @@ def _prefer_main_html(html: str) -> str:
 
 
 class GojoHNService:
-    """Production service for Hacker News feeds and intelligent summaries."""
+    """Production service for Hacker News feeds, discussion trees, and intelligent summaries."""
 
     def __init__(
         self,
         *,
         feed_source: FeedSource | None = None,
+        algolia_provider: HackerNewsAlgoliaProvider | None = None,
         storage: StorageBackend | None = None,
+        llm_provider: LLMProvider | None = None,
         openai_api_key: str | None = None,
         default_model: str | None = None,
         enable_jina_fallback: bool | None = None,
         custom_summarizer: Callable[..., Coroutine[Any, Any, str]] | None = None,
     ) -> None:
         self.source = feed_source or HackerNewsFeedSource()
+        self.algolia = algolia_provider or HackerNewsAlgoliaProvider()
         self.storage = storage or SQLiteStorage(
             os.getenv("GOJO_HN_DB_PATH", "gojo_hn.db")
         )
         self.api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.default_model = default_model or os.getenv("GOJO_HN_MODEL", "gpt-4o-mini")
-        
+
+        if llm_provider is not None:
+            self.llm_provider = llm_provider
+        elif self.api_key:
+            self.llm_provider = OpenAIProvider(api_key=self.api_key)
+        else:
+            self.llm_provider = AutoLLMProvider()
+
         jina_env = os.getenv("GOJO_HN_JINA_FALLBACK", "true").lower() in ("true", "1", "yes")
         self.enable_jina_fallback = enable_jina_fallback if enable_jina_fallback is not None else jina_env
         self.custom_summarizer = custom_summarizer
@@ -93,7 +111,7 @@ class GojoHNService:
         self._article_http: httpx.AsyncClient | None = None
 
     async def _article_client(self) -> httpx.AsyncClient:
-        if self._article_http is None:
+        if self._article_http is None or self._article_http.is_closed:
             self._article_http = httpx.AsyncClient(
                 timeout=PAGE_FETCH_TIMEOUT_S,
                 follow_redirects=True,
@@ -104,9 +122,10 @@ class GojoHNService:
 
     async def close(self) -> None:
         """Close open HTTP client connections."""
-        if self._article_http is not None:
+        if self._article_http is not None and not self._article_http.is_closed:
             await self._article_http.aclose()
             self._article_http = None
+        await self.algolia.close()
 
     async def list_feed(
         self,
@@ -148,13 +167,16 @@ class GojoHNService:
         items, has_more = await self.source.list_page(
             feed_variant=variant, page=page, page_size=page_size
         )
+
         now = datetime.now(timezone.utc)
         payload = {
-            "items": [i.model_dump(mode="json") for i in items],
+            "feed_id": feed_id,
+            "page": page,
             "has_more": has_more,
             "refreshed_at": now.isoformat(),
+            "items": [it.model_dump(mode="json") for it in items],
         }
-        await self.storage.set_feed_cache(feed_id, page, payload, LIST_CACHE_TTL_S)
+        await self.storage.set_feed_cache(feed_id, page, payload, ttl_seconds=LIST_CACHE_TTL_S)
 
         return DigestFeedResponse(
             feed_id=feed_id,
@@ -166,14 +188,18 @@ class GojoHNService:
             list_cache_ttl_seconds=LIST_CACHE_TTL_S,
         )
 
-    async def get_cached_summary(
+    async def get_artifact(self, artifact_id: str) -> DigestArtifact | None:
+        """Retrieve a saved digest artifact by its primary key UUID."""
+        return await self.storage.get_artifact(artifact_id)
+
+    async def get_artifact_by_external_id(
         self,
-        *,
         external_id: str,
+        *,
         summary_type: str = "quick",
         locale: str = "en",
-    ) -> DigestSummaryResponse | None:
-        """Lookup stored summary without triggering external fetch or AI generation."""
+    ) -> DigestArtifact | None:
+        """Find artifact matching external ID, summary type, and locale."""
         st = normalize_summary_type(summary_type)
         eff_locale = effective_locale_for_summary(locale, st)
         fp = digest_fingerprint(
@@ -183,18 +209,7 @@ class GojoHNService:
             prompt_version=PROMPT_VERSION,
             summary_type=st,
         )
-
-        art = await self.storage.get_artifact_by_fingerprint(fp)
-        if art:
-            return DigestSummaryResponse(
-                artifact=art,
-                completion=DigestCompletion(status="cached", cache_layer="sqlite", hydrated=True),
-            )
-        return None
-
-    async def get_artifact(self, *, artifact_id: str) -> DigestArtifact | None:
-        """Retrieve stored artifact by UUID."""
-        return await self.storage.get_artifact_by_id(artifact_id)
+        return await self.storage.get_artifact_by_fingerprint(fp)
 
     async def summarize(
         self,
@@ -202,9 +217,10 @@ class GojoHNService:
         external_id: str,
         summary_type: str = "quick",
         locale: str = "en",
-        user_id: str = "standalone",
         model: str | None = None,
         force_regenerate: bool = False,
+        user_id: str | None = None,
+        include_comments: bool = True,
     ) -> DigestSummaryResponse:
         """
         Generate or fetch cached summary for a Hacker News story.
@@ -253,6 +269,14 @@ class GojoHNService:
             content_to_summarize = f"{title}\nContent: {raw.get('text')}"
             source_fetch_status = "ok"
 
+        # Harvest discussion context from Algolia in 1 request
+        discussion_context = ""
+        if include_comments:
+            try:
+                discussion_context = await self.algolia.fetch_discussion_context(str(external_id))
+            except Exception:
+                discussion_context = ""
+
         use_model = model or self.default_model
         t0 = time.perf_counter()
 
@@ -262,6 +286,7 @@ class GojoHNService:
             content=content_to_summarize,
             summary_type=st,
             source_fetch_status=source_fetch_status,
+            discussion_context=discussion_context,
         )
         generated_ms = int((time.perf_counter() - t0) * 1000)
         summary_extra = extract_summary_extra_from_markdown(summary_markdown)
@@ -295,7 +320,7 @@ class GojoHNService:
         )
 
     async def _fetch_article_text(self, title: str, url: str) -> tuple[str, str]:
-        """Fetch article HTML or fallback via Jina reader."""
+        """Fetch article HTML using Trafilatura or fallback via Jina reader."""
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -310,22 +335,37 @@ class GojoHNService:
             client = await self._article_client()
             r = await client.get(url, headers=headers)
             r.raise_for_status()
-            html = _prefer_main_html(r.text)
-            direct_body = _strip_html(html)
-            direct_ok = True
+            raw_html = r.text
+
+            # Tier 1: Trafilatura (structural markdown content extraction)
+            try:
+                import trafilatura
+                trafil_text = trafilatura.extract(raw_html, output_format="markdown", include_links=False)
+                if trafil_text and len(trafil_text.strip()) >= 250:
+                    direct_body = trafil_text.strip()
+                    direct_ok = True
+            except Exception:
+                pass
+
+            # Tier 2: Prefer main/article tag + regex strip
+            if not direct_ok:
+                html = _prefer_main_html(raw_html)
+                direct_body = _strip_html(html)
+                direct_ok = True
         except Exception:
             pass
 
         if direct_ok and len(direct_body) >= 500:
-            return f"Title: {title}\nContent: {direct_body}", "ok"
+            return f"Title: {title}\nContent: {direct_body[:25000]}", "ok"
 
+        # Tier 3: Jina Reader fallback
         if self.enable_jina_fallback:
             jina_text = await self._fetch_via_jina_reader(url)
             if jina_text and len(jina_text) >= 280:
-                return f"Title: {title}\nContent: {jina_text}", "ok"
+                return f"Title: {title}\nContent: {jina_text[:25000]}", "ok"
 
         if direct_ok and len(direct_body) >= 80:
-            return f"Title: {title}\nContent: {direct_body}", "ok"
+            return f"Title: {title}\nContent: {direct_body[:25000]}", "ok"
 
         return f"{title}\n(Could not fetch page content; summarize from title.)", "error"
 
@@ -359,38 +399,83 @@ class GojoHNService:
         content: str,
         summary_type: SummaryType,
         source_fetch_status: str,
+        discussion_context: str | None = None,
     ) -> str:
-        """Call LLM summarizer using custom callback or OpenAI client."""
+        """Call LLM summarizer using custom callback or configured LLM provider."""
         if self.custom_summarizer is not None:
-            return await self.custom_summarizer(
-                model=model,
-                locale=locale,
-                content=content,
-                summary_type=summary_type,
-                source_fetch_status=source_fetch_status,
-            )
+            try:
+                return await self.custom_summarizer(
+                    model=model,
+                    locale=locale,
+                    content=content,
+                    summary_type=summary_type,
+                    source_fetch_status=source_fetch_status,
+                    discussion_context=discussion_context,
+                )
+            except TypeError:
+                return await self.custom_summarizer(
+                    model=model,
+                    locale=locale,
+                    content=content,
+                    summary_type=summary_type,
+                    source_fetch_status=source_fetch_status,
+                )
 
-        if not self.api_key:
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. Provide an API key or a custom_summarizer function."
-            )
+        system_prompt = build_digest_system_prompt(
+            summary_type=summary_type,
+            locale=locale,
+            include_discussion=bool(discussion_context and discussion_context.strip()),
+        )
+        user_message = build_digest_user_message(
+            content,
+            source_fetch_status=source_fetch_status,
+            discussion_context=discussion_context,
+        )
 
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(api_key=self.api_key)
-        system_prompt = build_digest_system_prompt(summary_type=summary_type, locale=locale)
-        user_message = build_digest_user_message(content, source_fetch_status=source_fetch_status)
-
-        resp = await client.chat.completions.create(
+        return await self.llm_provider.complete(
+            system_prompt=system_prompt,
+            user_message=user_message,
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
             max_tokens=4096,
         )
 
-        if not resp.choices or not resp.choices[0].message.content:
-            raise RuntimeError("Summarization model returned an empty response.")
+    async def create_briefing(
+        self,
+        *,
+        feed_id: str = "hn_top",
+        limit: int = 10,
+        locale: str = "en",
+        model: str | None = None,
+    ) -> str:
+        """
+        Generate a multi-story executive technical briefing synthesizing top stories.
+        """
+        feed = await self.list_feed(feed_id=feed_id, page=1)
+        items = feed.items[:limit]
+        if not items:
+            return "No stories available to create briefing."
 
-        return resp.choices[0].message.content.strip()
+        context_lines = [
+            f"=== Hacker News Feed: {feed_id.upper()} (Top {len(items)} Stories) ===\n"
+        ]
+        for idx, it in enumerate(items, 1):
+            context_lines.append(
+                f"{idx}. [{it.external_id}] {it.title}\n"
+                f"   Score: {it.score} pts | Comments: {it.descendants} | By: @{it.by or 'unknown'}\n"
+                f"   URL: {it.url or 'HN Discussion'}\n"
+            )
+
+        stories_context = "\n".join(context_lines)
+        system_prompt = build_briefing_system_prompt(locale=locale)
+        user_msg = (
+            f"Please synthesize the following top Hacker News developments into an authoritative Executive Briefing:\n\n"
+            f"{stories_context}"
+        )
+
+        use_model = model or self.default_model
+        return await self.llm_provider.complete(
+            system_prompt=system_prompt,
+            user_message=user_msg,
+            model=use_model,
+            max_tokens=4096,
+        )

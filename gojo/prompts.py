@@ -26,13 +26,29 @@ def effective_locale_for_summary(locale: str, summary_type: SummaryType) -> str:
     return locale or "en"
 
 
-def build_digest_system_prompt(*, summary_type: SummaryType, locale: str) -> str:
+def build_digest_system_prompt(
+    *,
+    summary_type: SummaryType,
+    locale: str,
+    include_discussion: bool = False,
+) -> str:
     el = effective_locale_for_summary(locale, summary_type)
     base_lang = f"Write in the language matching locale '{el}' (ISO-style)."
+    
+    discussion_sections = (
+        "### Community consensus\n"
+        "(what engineers in comments agreed on, challenged, debunked, or practical experiences shared)\n"
+        "### Alternative solutions\n"
+        "(prior art, alternative tools, or libraries mentioned in discussion, if any)\n"
+        if include_discussion
+        else ""
+    )
+    
     structure = (
         "Output GitHub-flavored Markdown with this structure:\n"
         "## Summary\n"
         "(main narrative — follow the mode below; lead with the most useful facts)\n"
+        f"{discussion_sections}"
         "### Why it matters\n"
         "(2–4 sentences when the source is rich; 1–2 when thin; stay specific to this story)\n"
         "### Key takeaway\n"
@@ -96,7 +112,12 @@ def build_digest_system_prompt(*, summary_type: SummaryType, locale: str) -> str
     )
 
 
-def build_digest_user_message(content: str, *, source_fetch_status: str) -> str:
+def build_digest_user_message(
+    content: str,
+    *,
+    source_fetch_status: str,
+    discussion_context: str | None = None,
+) -> str:
     st = (source_fetch_status or "fallback_title").strip().lower()
     if st == "ok":
         n = len(content)
@@ -130,4 +151,33 @@ def build_digest_user_message(content: str, *, source_fetch_status: str) -> str:
             "Source: thin input (e.g. title-only). Summarize what can be responsibly inferred; "
             "state gaps plainly without stock phrases.\n"
         )
-    return f"{preamble}\n\n{content}"
+    
+    body = f"{preamble}\n\n{content}"
+    if discussion_context and discussion_context.strip():
+        body += f"\n\n{discussion_context.strip()}"
+    return body
+
+
+def build_briefing_system_prompt(*, locale: str = "en") -> str:
+    """System prompt for multi-story executive technical briefings."""
+    base_lang = f"Write in the language matching locale '{locale}' (ISO-style, e.g. 'th' for Thai, 'en' for English)."
+    return (
+        "You are an executive technology editor delivering an authoritative, high-density briefing on top tech developments.\n"
+        f"{base_lang}\n"
+        "Voice: confident editor briefing technical leaders—concrete facts, numbers, mechanisms, and cross-cutting implications.\n"
+        "Anti-slop: banned terms: \"delve\", \"landscape\", \"robust\", \"leverage\", \"synergy\", \"game-changer\", \"In today's world\".\n\n"
+        "Output GitHub-flavored Markdown with this exact structure:\n"
+        "# Executive Technology Briefing\n\n"
+        "## Key Themes & Macro Shifts\n"
+        "(2-3 paragraphs synthesizing the overarching narratives across these stories, highlighting security boundaries, AI developments, or infrastructure realities)\n\n"
+        "## Thematic Clusters\n"
+        "(Group the stories into 3-4 thematic categories like: Security & Privacy, AI & Models, Systems & Embedded, Web & Platforms)\n"
+        "For each category:\n"
+        "### [Category Name]\n"
+        "- **[Story Title]** (Score: X, Comments: Y)\n"
+        "  - Core fact & mechanism (1-2 tight sentences)\n"
+        "  - Industry impact or engineering takeaway\n\n"
+        "## Actionable Takeaways for Builders\n"
+        "(3-5 bullet points of concrete advice, cautionary lessons, or architectural patterns engineers should adopt today)"
+    )
+
