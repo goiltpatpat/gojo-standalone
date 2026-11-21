@@ -1,5 +1,7 @@
 from .base import FeedSource
+from .github_trending import GitHubTrendingFeedSource
 from .hn import HackerNewsFeedSource
+from .lobsters import LobstersFeedSource
 from .algolia import HackerNewsAlgoliaProvider
 from .llm import (
     AutoLLMProvider,
@@ -12,6 +14,8 @@ from .llm import (
 __all__ = [
     "FeedSource",
     "HackerNewsFeedSource",
+    "LobstersFeedSource",
+    "GitHubTrendingFeedSource",
     "HackerNewsAlgoliaProvider",
     "LLMProvider",
     "OpenAIProvider",
