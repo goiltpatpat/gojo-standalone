@@ -4,7 +4,7 @@
   <img src="assets/gojo_mascot.png" width="280" alt="Gojo Mascot — The Boundless Tech Intelligence Engine" />
 </p>
 
-A self-contained, production-grade Hacker News intelligence pipeline, summarization engine, and AI agent tool suite. Extracted and distilled from `patzelife-plugin-agentdiscord` into a standalone, modular package powered by the **Six Eyes (Rikugan)** signal, extraction, and local-first archive architecture.
+A self-contained, production-grade Hacker News intelligence pipeline, summarization engine, and AI agent toolkit (`gojo-hn` **v2.1.0**, PEP 561 typed). Extracted and distilled from `patzelife-plugin-agentdiscord` into a standalone, modular package powered by the **Six Eyes (Rikugan)** signal, extraction, and local-first archive architecture.
 
 ---
 
@@ -12,7 +12,7 @@ A self-contained, production-grade Hacker News intelligence pipeline, summarizat
 
 1. **Multi-Feed Hacker News & Algolia Providers (`gojo.providers.hn`, `gojo.providers.algolia`)**:
    - Full coverage of all 5 Hacker News Firebase feeds: `hn_top` (`topstories`), `hn_new` (`newstories`), `hn_best` (`beststories`), `hn_ask` (`askstories`), and `hn_show` (`showstories`), plus `/v0/item/{id}.json`.
-   - Pooled `httpx.AsyncClient` connections with `asyncio.Semaphore(12)` concurrency control, exponential backoff retries, and clean `close()` teardown.
+   - Pooled `httpx.AsyncClient` connections with `asyncio.Semaphore(12)` concurrency control, exponential backoff retries, and `async with GojoHNService() as svc:` teardown.
    - Single-request **Algolia Search API** client for nested comment trees with root-subtree scoring that preserves parent→child causality and emits `[1]` / `[1.1]` thread-path citations, plus full-archive `search_stories()`.
 
 2. **SSRF & Transport Security (`gojo.ssrf`, `gojo.service`)**:
@@ -29,14 +29,15 @@ A self-contained, production-grade Hacker News intelligence pipeline, summarizat
    - **OpenAI** (`OPENAI_API_KEY`), **Google Gemini** (`GEMINI_API_KEY`), and offline **Local Ollama** (`http://localhost:11434` with automatic model discovery) using pooled HTTP/LLM clients.
    - **`AutoLLMProvider` Runtime Failover**: Automatic cascade `OpenAI -> Gemini -> Ollama` with a cooldown circuit breaker on transient errors (429 / 5xx / transport), universal `<think>` tag stripping for reasoning models, and accurate `last_used_model` / `last_used_provider` recording.
 
-5. **Six Eyes Signal Engine (`gojo.signals`)**:
+5. **Six Eyes Signal Engine & Zero-Token Radar (`gojo.signals`, `svc.radar`)**:
    - Pure-Python, zero-dependency story enrichment computing HN gravity-normalized `velocity`, `debate_ratio`, and deterministic `signal_badges` (`breakout`, `rising`, `high-debate`, `slow-burn`).
    - URL canonicalization (strips `utm_*`, tracking params, fragments, and default ports) and 64-bit deterministic SimHash + Jaccard event clustering to group duplicate/related stories covering the same event.
-   - Zero-token local Okapi BM25 `--focus` re-ranking across title, URL, and body text.
+   - Zero-token local Okapi BM25 `--focus` re-ranking across title, URL, and body text, plus multi-feed **`hn_radar`** scanning with zero LLM tokens spent.
 
-6. **Multi-Style AI Summarization & Multilingual Parsing (`gojo.prompts`, `gojo.interpretation`)**:
+6. **Multi-Style AI Summarization, Deep Dive Dossiers & Multilingual Parsing (`gojo.prompts`, `gojo.interpretation`)**:
    - Four anti-slop styles: **`quick`**, **`technical`**, **`bullet`**, and **`thai_concise`**.
    - **Consensus vs. Contrarian / Debunked Synthesis**: Prompt templates separate peer consensus, contrarian pushback, and cited thread paths (`[1]`, `[1.1]`) alongside alternative tools.
+   - **Concurrent Topic Deep Dive (`hn_deep_dive`)**: Searches both local FTS5 and full Algolia HN archives, selects top distinct stories, summarizes concurrently with deterministic SHA-256 cache reuse, and returns a structured research dossier.
    - **Multilingual Structured Extraction**: `interpretation.py` parses `why_matters`, `key_takeaway`, `note`, `community_consensus`, and `alternative_solutions` from both English and Thai headings.
 
 7. **Executive Tech Briefing & Delta Mode (`create_briefing`)**:
@@ -48,9 +49,10 @@ A self-contained, production-grade Hacker News intelligence pipeline, summarizat
    - Built-in **FTS5** full-text search index (`hn_artifacts_fts` + BM25 ranking) for searching archived summaries and `hn_story_snapshots` for cross-run delta tracking.
    - Ephemeral **In-Memory** backend for tests and extensible `StorageBackend` ABC.
 
-9. **AI Agent Tools & Optional FastMCP Server (`gojo.agent_tools`, `gojo.mcp_server`)**:
-   - 6 ready-to-use function schemas in `HN_AGENT_TOOL_DEFINITIONS` (`hn_search`, `hn_summarize`, `hn_briefing`, `hn_get_story`, `hn_search_archive`, `hn_get_artifact`) with `max_chars` token budgeting on agent formatters.
-   - Optional stdio **FastMCP** server (`python3 -m gojo.cli mcp`) enabled via `pip install -e ".[mcp]"`.
+9. **`GojoAgentToolkit` (9 Tools) & Upgraded FastMCP Server (`gojo.agent_tools`, `gojo.mcp_server`)**:
+   - **`GojoAgentToolkit`**: One-line `async with GojoAgentToolkit() as kit:`, provider-native schema export via `kit.schemas("openai" | "anthropic" | "gemini")`, and crash-proof `await kit.dispatch(name, args, max_chars=..., as_text=True)`.
+   - **9 Agent Tools** in `HN_AGENT_TOOL_DEFINITIONS`: `hn_search`, `hn_search_full`, `hn_radar`, `hn_summarize`, `hn_deep_dive`, `hn_briefing`, `hn_get_story`, `hn_search_archive`, and `hn_get_artifact` with `max_chars` token budgeting.
+   - **FastMCP Stdio Server (`python3 -m gojo.cli mcp`)**: Exposes all 9 tools with `max_chars` support, 2 MCP Prompts (`morning_tech_radar`, `topic_deep_dive`), and 2 MCP Resources (`gojo://providers`, `gojo://archive/recent`).
 
 ---
 
@@ -58,29 +60,37 @@ A self-contained, production-grade Hacker News intelligence pipeline, summarizat
 
 ```text
 gojo-standalone/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # GitHub Actions CI (Python 3.10–3.12 matrix)
+├── examples/
+│   ├── agent_sdk_quickstart.py   # GojoAgentToolkit multi-SDK quickstart
+│   └── mcp_client_config.json    # Ready-to-use MCP client config
 ├── gojo/
-│   ├── __init__.py           # Package exports
-│   ├── types.py              # Normalized Pydantic models (DigestFeedItem, DigestArtifact, etc.)
-│   ├── fingerprint.py        # SHA-256 idempotency key generation
-│   ├── ssrf.py               # Static + async DNS SSRF validator & IP classification
-│   ├── signals.py            # Six Eyes Signal Engine (velocity, badges, SimHash, clustering, BM25)
-│   ├── prompts.py            # Anti-slop prompt templates, Consensus/Contrarian & briefing modes
-│   ├── interpretation.py     # English & Thai regex extractor for structured summary insights
-│   ├── service.py            # Core GojoHNService orchestrator & hop-by-hop extraction pipeline
-│   ├── agent_tools.py        # 6 AI Agent tool schemas, executors & max_chars formatters
-│   ├── mcp_server.py         # Optional lazy-loaded FastMCP stdio server wrapper
-│   ├── cli.py                # Standalone Command-Line Interface (gojo-hn)
+│   ├── __init__.py               # Package exports
+│   ├── py.typed                  # PEP 561 inline typing marker
+│   ├── types.py                  # Normalized Pydantic models (DigestFeedItem, DigestArtifact, etc.)
+│   ├── fingerprint.py            # SHA-256 idempotency key generation
+│   ├── ssrf.py                   # Static + async DNS SSRF validator & IP classification
+│   ├── signals.py                # Six Eyes Signal Engine (velocity, badges, SimHash, clustering, BM25)
+│   ├── prompts.py                # Anti-slop prompt templates, Consensus/Contrarian & briefing modes
+│   ├── interpretation.py         # English & Thai regex extractor for structured summary insights
+│   ├── service.py                # Core GojoHNService orchestrator, radar, deep_dive & extraction pipeline
+│   ├── agent_tools.py            # GojoAgentToolkit, 9 tool schemas, executors & max_chars formatters
+│   ├── mcp_server.py             # Optional lazy-loaded FastMCP server (9 tools, 2 prompts, 2 resources)
+│   ├── cli.py                    # Standalone Command-Line Interface (gojo-hn)
 │   ├── providers/
-│   │   ├── base.py           # FeedSource ABC
-│   │   ├── hn.py             # Firebase HN API (5 feeds, pooled httpx, semaphore + retries)
-│   │   ├── algolia.py        # Algolia subtree-scored comments & archive story search
-│   │   └── llm.py            # OpenAI, Gemini, Ollama & AutoLLMProvider runtime failover
+│   │   ├── base.py               # FeedSource ABC
+│   │   ├── hn.py                 # Firebase HN API (5 feeds, pooled httpx, semaphore + retries)
+│   │   ├── algolia.py            # Algolia subtree-scored comments & archive story search
+│   │   └── llm.py                # OpenAI, Gemini, Ollama & AutoLLMProvider runtime failover
 │   └── storage/
-│       ├── base.py           # StorageBackend ABC
-│       ├── memory.py         # Ephemeral In-Memory backend
-│       └── sqlite.py         # WAL SQLite backend with FTS5 archive & story snapshots
-├── tests/                    # Automated pytest suite (83 unit tests)
-├── pyproject.toml
+│       ├── base.py               # StorageBackend ABC
+│       ├── memory.py             # Ephemeral In-Memory backend
+│       └── sqlite.py             # WAL SQLite backend with FTS5 archive & story snapshots
+├── tests/                        # Automated pytest suite (91 unit tests)
+├── AGENTS.md                     # Machine-readable operational contract for AI agents
+├── pyproject.toml                # v2.1.0 packaging, extras ([ai], [mcp], [docs], [all], [test], [dev])
 └── requirements.txt
 ```
 
@@ -100,7 +110,8 @@ pip install -r requirements.txt
 pip install -e ".[ai]"          # OpenAI / Gemini SDK
 pip install -e ".[mcp]"         # Optional FastMCP stdio server
 pip install -e ".[docs]"        # Optional PDF extraction (pypdf)
-pip install -e ".[ai,mcp,docs,test]"
+pip install -e ".[all]"         # All runtime extras (ai + mcp + docs)
+pip install -e ".[dev]"         # Development & QA tools (pytest, pytest-asyncio, ruff)
 ```
 
 ### 2. Configuration (Optional)
@@ -139,7 +150,19 @@ python3 -m gojo.cli list --feed show --focus "rust sqlite" --force --json
 python3 -m gojo.cli search "Rust" --feed best --limit 30 --focus "compiler"
 ```
 
-### Search Local FTS5 Summary Archive
+### Zero-Token Six Eyes Signal Radar (`radar`)
+```bash
+# Scan top + best feeds concurrently, filter by signal badges, and cluster related stories
+python3 -m gojo.cli radar --feeds top best --top 10 --focus "ai systems" --badges breakout high-debate --json
+```
+
+### Search Full Historical HN Archive (`hn-archive`)
+```bash
+# Query the full Algolia Hacker News archive with Six Eyes signal enrichment
+python3 -m gojo.cli hn-archive "sqlite wal" --limit 15 --sort relevance --json
+```
+
+### Search Local FTS5 Summary Archive (`archive-search`)
 ```bash
 python3 -m gojo.cli archive-search "kernel ebpf" --limit 10 --json
 ```
@@ -161,6 +184,12 @@ python3 -m gojo.cli summarize 50354960 --type thai_concise
 python3 -m gojo.cli summarize 50354960 --type technical --force --no-comments --json
 ```
 
+### Multi-Story Research Dossier (`deep-dive`)
+```bash
+# Search local + Algolia HN archives and summarize top stories concurrently (reusing cache)
+python3 -m gojo.cli deep-dive "rust async" --max-stories 3 --type technical --locale en --json
+```
+
 ### Executive Daily Briefing & `--since-last` Deltas
 ```bash
 # English briefing of top 10 stories focused on systems/security
@@ -177,9 +206,10 @@ python3 -m gojo.cli providers --json
 
 ### Run Optional FastMCP Server (stdio)
 ```bash
-# Requires: pip install -e ".[mcp]"
+# Requires: pip install -e ".[mcp]" (or ".[all]")
 python3 -m gojo.cli mcp
 ```
+Exposes all 9 tools (with `max_chars` token budgeting), 2 MCP Prompts (`morning_tech_radar`, `topic_deep_dive`), and 2 MCP Resources (`gojo://providers`, `gojo://archive/recent`). See [examples/mcp_client_config.json](examples/mcp_client_config.json) for client setup.
 
 ---
 
@@ -192,8 +222,7 @@ import asyncio
 from gojo import GojoHNService
 
 async def main():
-    svc = GojoHNService()
-    try:
+    async with GojoHNService() as svc:
         # 1. Fetch top feed (enriched with velocity, debate_ratio, signal_badges)
         feed = await svc.list_feed(feed_id="hn_top", page=1)
         for story in feed.items[:5]:
@@ -214,58 +243,42 @@ async def main():
         # 3. Query local FTS5 archive
         archived = await svc.search_archive("rust", limit=5)
         print(f"Archive matches: {len(archived)}")
-    finally:
-        await svc.close()
 
 asyncio.run(main())
 ```
 
-### Using with AI Agents (Function Calling)
+### Using `GojoAgentToolkit` with AI Agents (OpenAI / Anthropic / Gemini)
+
+See [examples/agent_sdk_quickstart.py](examples/agent_sdk_quickstart.py) for a runnable script:
 
 ```python
-from gojo import GojoHNService
-from gojo.agent_tools import (
-    HN_AGENT_TOOL_DEFINITIONS,
-    tool_search_hn,
-    tool_summarize_hn,
-    tool_briefing_hn,
-    tool_get_hn_story,
-    tool_search_archive,
-    tool_get_artifact,
-    format_search_for_agent,
-    format_summary_for_agent,
-    format_archive_search_for_agent,
-)
+import asyncio
+from gojo import GojoAgentToolkit
 
-# Register HN_AGENT_TOOL_DEFINITIONS (6 tools) with your OpenAI / Anthropic / Gemini client
-async def handle_agent_call(name: str, args: dict):
-    svc = GojoHNService()
-    try:
-        if name == "hn_search":
-            res = await tool_search_hn(svc, **args)
-            return format_search_for_agent(res, max_chars=4000)
-        elif name == "hn_summarize":
-            res = await tool_summarize_hn(svc, **args)
-            return format_summary_for_agent(res, max_chars=6000)
-        elif name == "hn_briefing":
-            res = await tool_briefing_hn(svc, **args)
-            return res["briefing_markdown"]
-        elif name == "hn_get_story":
-            return await tool_get_hn_story(svc, **args)
-        elif name == "hn_search_archive":
-            res = await tool_search_archive(svc, **args)
-            return format_archive_search_for_agent(res, max_chars=4000)
-        elif name == "hn_get_artifact":
-            return await tool_get_artifact(svc, **args)
-    finally:
-        await svc.close()
+async def main():
+    async with GojoAgentToolkit() as kit:
+        # Export all 9 tool schemas formatted for your LLM SDK
+        openai_tools = kit.schemas("openai")
+        anthropic_tools = kit.schemas("anthropic")
+        gemini_tools = kit.schemas("gemini")
+
+        # Dispatch any tool safely with hard character budgeting
+        radar_md = await kit.dispatch(
+            "hn_radar",
+            {"feeds": ["hn_top", "hn_best"], "focus": "rust, ai systems", "top_n": 5},
+            max_chars=3000,
+            as_text=True,
+        )
+        print(radar_md)
+
+asyncio.run(main())
 ```
 
 ---
 
-## 🧪 Testing
+## 🧪 Testing & CI
 
-Run the full automated test suite (83 unit tests):
+Run the full automated test suite (91 unit tests, also verified on Python 3.10–3.12 via `.github/workflows/ci.yml`):
 
 ```bash
 python3 -m pytest tests -v
