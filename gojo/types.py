@@ -10,28 +10,51 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-FeedProviderId = Literal["hn"]
-DigestFeedId = Literal["hn_top", "hn_new", "hn_best", "hn_ask", "hn_show"]
+FeedProviderId = Literal["hn", "lobsters", "github"]
+DigestFeedId = Literal[
+    "hn_top",
+    "hn_new",
+    "hn_best",
+    "hn_ask",
+    "hn_show",
+    "lobsters_hot",
+    "lobsters_new",
+    "github_trending",
+]
+ALL_SUPPORTED_FEED_IDS: tuple[str, ...] = (
+    "hn_top",
+    "hn_new",
+    "hn_best",
+    "hn_ask",
+    "hn_show",
+    "lobsters_hot",
+    "lobsters_new",
+    "github_trending",
+)
 SummaryType = Literal["quick", "technical", "bullet", "thai_concise"]
 DigestCacheLayer = Literal["memory", "sqlite", "origin"]
 
 
 class DigestFeedItem(BaseModel):
-    """Normalized Hacker News item representation."""
+    """Normalized feed item representation across multi-sensor providers."""
 
     feed_provider: str = "hn"
     external_id: str
     title: str | None = None
     url: str | None = None
+    hn_url: str | None = None
     text: str | None = None
     score: int | None = None
     by: str | None = None
+    author: str | None = None
     time: int | None = None
+    created_at: datetime | None = None
     type: str | None = None
     descendants: int | None = None
     velocity: float | None = None
     debate_ratio: float | None = None
     signal_badges: list[str] = Field(default_factory=list)
+    raw: dict[str, Any] | None = None
 
 
 FeedItem = DigestFeedItem
