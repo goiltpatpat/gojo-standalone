@@ -23,10 +23,29 @@ def test_build_digest_system_prompt_anti_slop_and_structure() -> None:
     p = build_digest_system_prompt(summary_type="quick", locale="en")
     assert "Anti-slop" in p
     assert "From the title alone" in p
+    assert "delve" in p
+    assert "landscape" in p
+    assert "leverage" in p
+    assert "robust" in p
+    assert "synergy" in p
+    assert "game-changer" in p
     assert "## Summary" in p
     assert "### Why it matters" in p
     assert "### Key takeaway" in p
     assert "### Gojo note" in p
+
+
+def test_build_digest_system_prompt_discussion_consensus_vs_contrarian() -> None:
+    p = build_digest_system_prompt(
+        summary_type="technical",
+        locale="en",
+        include_discussion=True,
+    )
+    assert "### Community consensus" in p
+    assert "Consensus" in p
+    assert "Contrarian / Debunked" in p
+    assert "[1] @handle" in p
+    assert "### Alternative solutions" in p
 
 
 def test_build_digest_user_message_variants() -> None:
