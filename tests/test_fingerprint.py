@@ -1,4 +1,3 @@
-import hashlib
 from gojo.fingerprint import digest_fingerprint
 
 

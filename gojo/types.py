@@ -4,9 +4,9 @@ Data types and schemas for Gojo Hacker News workflow.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any, Literal
-import uuid
 
 from pydantic import BaseModel, Field
 

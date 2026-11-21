@@ -11,11 +11,11 @@ Six Eyes Signal Engine — Pure-Python, zero-dependency intelligence primitives:
 
 from __future__ import annotations
 
-from collections import Counter
-from datetime import datetime, timezone
 import hashlib
 import math
 import re
+from collections import Counter
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -528,7 +528,7 @@ def rank_items_by_focus(
     b = 0.75
     scored: list[tuple[int, DigestFeedItem, float]] = []
 
-    for idx, (item, tokens, counter) in enumerate(zip(items, docs, doc_counters)):
+    for idx, (item, tokens, counter) in enumerate(zip(items, docs, doc_counters, strict=True)):
         dl = len(tokens)
         score = 0.0
         for term in unique_terms:

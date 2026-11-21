@@ -8,13 +8,14 @@ fingerprint deduplication, signal enrichment, and persistent caching.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import html as html_lib
 import io
 import os
 import re
 import time
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import urljoin
 
 import httpx
@@ -55,7 +56,6 @@ from .types import (
     DigestCompletion,
     DigestFeedItem,
     DigestFeedResponse,
-    DigestSummaryRequest,
     DigestSummaryResponse,
     SummaryType,
 )
@@ -819,7 +819,9 @@ class GojoHNService:
             *(self._lookup_cached_takeaway(it.external_id, locale) for it in items)
         )
         takeaways_by_id = {
-            it.external_id: tk for it, tk in zip(items, takeaways_list) if tk
+            it.external_id: tk
+            for it, tk in zip(items, takeaways_list, strict=True)
+            if tk
         }
 
         clusters = cluster_related_stories(items)
@@ -969,7 +971,7 @@ class GojoHNService:
         sensor_errors: list[dict[str, str]] = []
         deduped: list[DigestFeedItem] = []
         seen_keys: set[tuple[str, str]] = set()
-        for fid, resp in zip(target_feeds, feed_results):
+        for fid, resp in zip(target_feeds, feed_results, strict=True):
             if isinstance(resp, BaseException):
                 sensor_errors.append({"feed_id": fid, "error": str(resp)})
                 continue
@@ -1180,7 +1182,7 @@ class GojoHNService:
 
         summaries: list[dict[str, Any]] = []
         cached_hits = 0
-        for story_id, res in zip(selected_ids, summary_results):
+        for story_id, res in zip(selected_ids, summary_results, strict=True):
             if isinstance(res, BaseException):
                 errors.append({"external_id": story_id, "error": str(res)})
                 continue

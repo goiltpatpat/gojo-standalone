@@ -16,7 +16,6 @@ from gojo.agent_tools import (
     tool_briefing_hn,
     tool_deep_dive_hn,
     tool_get_artifact,
-    tool_get_hn_story,
     tool_radar_hn,
     tool_search_archive,
     tool_search_hn,
@@ -249,6 +248,7 @@ def test_mcp_server_import_safety_and_actionable_error() -> None:
 @pytest.mark.asyncio
 async def test_mcp_server_tool_parity_and_shared_lazy_service() -> None:
     import json
+
     import gojo.mcp_server as mcp_mod
 
     class _FakeFastMCP:
@@ -529,6 +529,7 @@ async def test_gojo_agent_toolkit_dispatch_success_json_args_max_chars_and_error
 @pytest.mark.asyncio
 async def test_mcp_server_prompts_resources_and_9_tools() -> None:
     import json
+
     import gojo.mcp_server as mcp_mod
 
     class _FullFakeFastMCP:

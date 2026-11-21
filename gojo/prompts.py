@@ -8,8 +8,6 @@ Digest summarization prompts and anti-slop guidelines across multiple summary st
 
 from __future__ import annotations
 
-from typing import Literal
-
 from .types import SummaryType
 
 
@@ -34,7 +32,7 @@ def build_digest_system_prompt(
 ) -> str:
     el = effective_locale_for_summary(locale, summary_type)
     base_lang = f"Write in the language matching locale '{el}' (ISO-style)."
-    
+
     discussion_sections = (
         "### Community consensus\n"
         "(Separate **Consensus** — what engineers agreed on or corroborated from real-world experience — "
@@ -45,7 +43,7 @@ def build_digest_system_prompt(
         if include_discussion
         else ""
     )
-    
+
     structure = (
         "Output GitHub-flavored Markdown with this structure:\n"
         "## Summary\n"
@@ -153,7 +151,7 @@ def build_digest_user_message(
             "Source: thin input (e.g. title-only). Summarize what can be responsibly inferred; "
             "state gaps plainly without stock phrases.\n"
         )
-    
+
     body = f"{preamble}\n\n{content}"
     if discussion_context and discussion_context.strip():
         body += f"\n\n{discussion_context.strip()}"

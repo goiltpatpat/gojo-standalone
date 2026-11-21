@@ -6,11 +6,11 @@ and zero-cost offline local inference via Ollama (localhost:11434).
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import asyncio
 import os
 import re
 import time
+from abc import ABC, abstractmethod
 from typing import Any
 
 import httpx
