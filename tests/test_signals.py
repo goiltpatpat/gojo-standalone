@@ -3,11 +3,14 @@ from datetime import datetime, timezone
 import pytest
 
 from gojo.signals import (
+    annotate_cross_source_clusters,
+    build_adaptive_focus_profile,
     canonicalize_url,
     cluster_related_stories,
     compute_story_signals,
     enrich_items_with_signals,
     hamming_distance,
+    profile_to_focus_query,
     rank_items_by_focus,
     simhash64,
 )
@@ -183,3 +186,205 @@ def test_rank_items_by_focus_bm25() -> None:
     assert ranked[2][1] == 0.0
     assert ranked[3][1] == 0.0
     assert [ranked[2][0].external_id, ranked[3][0].external_id] == ["1", "4"]
+
+
+def test_build_adaptive_focus_profile_empty_and_limits() -> None:
+    assert build_adaptive_focus_profile([]) == []
+    assert build_adaptive_focus_profile([{"title": "", "key_takeaway": ""}]) == []
+    assert build_adaptive_focus_profile([{"title": "Rust eBPF", "key_takeaway": "SQLite"}], top_terms=0) == []
+
+
+def test_build_adaptive_focus_profile_title_weighting_and_stopwords() -> None:
+    corpus = [
+        {
+            "title": "A New C++ and Go eBPF Runtime for AI DB Workloads",
+            "key_takeaway": "The article summary says Rust LLM SQLite 2026 x y z",
+            "source_url": "https://example.com/ebpf-runtime",
+        }
+    ]
+    profile = build_adaptive_focus_profile(corpus, top_terms=20, decay=0.92)
+    weights = dict(profile)
+
+    # Preserved short and special tech tokens
+    for tech_token in ("c++", "go", "ai", "db", "ebpf", "rust", "llm", "sqlite"):
+        assert tech_token in weights
+
+    # Filtered stopwords, boilerplate, single-char tokens, and pure numbers
+    for filtered in ("a", "new", "and", "for", "the", "article", "summary", "says", "2026", "x", "y", "z"):
+        assert filtered not in weights
+
+    # Title tokens receive 2.0x weight compared to key_takeaway tokens (1.0x)
+    assert weights["ebpf"] == pytest.approx(2.0 * weights["sqlite"], rel=1e-5)
+    assert weights["c++"] == pytest.approx(2.0 * weights["rust"], rel=1e-5)
+
+
+def test_build_adaptive_focus_profile_recency_decay_and_idf() -> None:
+    # Newest-first corpus: index 0 has decay**0 = 1.0, index 2 has decay**2
+    corpus = [
+        {"title": "eBPF tracing", "key_takeaway": "kernel telemetry"},
+        {"title": "SQLite WAL", "key_takeaway": "kernel storage"},
+        {"title": "Zig allocator", "key_takeaway": "kernel memory"},
+    ]
+    decay = 0.8
+    profile = build_adaptive_focus_profile(corpus, top_terms=10, decay=decay)
+    weights = dict(profile)
+
+    # All three unique title tokens have df=1, so recency decay strictly orders them
+    assert weights["ebpf"] > weights["sqlite"] > weights["zig"]
+    assert weights["sqlite"] == pytest.approx(weights["ebpf"] * decay, rel=1e-5)
+    assert weights["zig"] == pytest.approx(weights["ebpf"] * (decay**2), rel=1e-5)
+
+    # Returned list is sorted descending by weight and respects top_terms
+    top3 = build_adaptive_focus_profile(corpus, top_terms=3, decay=decay)
+    assert len(top3) == 3
+    assert [w for _, w in top3] == sorted((w for _, w in top3), reverse=True)
+
+
+def test_profile_to_focus_query_and_bm25_integration() -> None:
+    assert profile_to_focus_query([]) == ""
+    assert profile_to_focus_query([("rust", 5.0), ("ebpf", 3.0)], max_terms=0) == ""
+
+    corpus = [
+        {"title": "Rust Async Kernel Driver", "key_takeaway": "Zero-copy NVMe IO in Rust"},
+        {"title": "eBPF Network Filtering in Rust", "key_takeaway": "XDP packet processing"},
+    ]
+    profile = build_adaptive_focus_profile(corpus, top_terms=10)
+    query = profile_to_focus_query(profile, max_terms=5)
+    tokens = query.split()
+    assert 1 <= len(tokens) <= 5
+    assert "rust" in tokens
+
+    candidates = [
+        DigestFeedItem(external_id="1", title="CSS Grid Layout Tips"),
+        DigestFeedItem(external_id="2", title="Writing an eBPF Packet Filter in Rust"),
+        DigestFeedItem(external_id="3", title="Baking Sourdough Bread"),
+    ]
+    ranked = rank_items_by_focus(candidates, query)
+    assert ranked[0][0].external_id == "2"
+    assert ranked[0][1] > 0.0
+
+
+def test_annotate_cross_source_clusters_detection_badges_and_ranking() -> None:
+    assert annotate_cross_source_clusters([]) == []
+    assert annotate_cross_source_clusters([[]]) == []
+
+    # 3-source corroborated cluster (hn + lobsters + github) with moderate velocity
+    tri_hn = DigestFeedItem(
+        external_id="10",
+        feed_provider="hn",
+        title="SQLite 3.51 Concurrent WAL Mode",
+        url="https://sqlite.org/wal-351",
+        velocity=12.5,
+        signal_badges=["rising"],
+    )
+    tri_lobsters = DigestFeedItem(
+        external_id="lob-10",
+        feed_provider="lobsters",
+        title="SQLite 3.51 Concurrent WAL Mode",
+        url="https://sqlite.org/wal-351?utm_source=lobsters",
+        velocity=8.0,
+        signal_badges=["corroborated"],  # already present -> must not duplicate
+    )
+    tri_github = DigestFeedItem(
+        external_id="gh-10",
+        feed_provider="github",
+        title="SQLite 3.51 Concurrent WAL Mode Release",
+        url="https://sqlite.org/wal-351#readme",
+        velocity=6.0,
+        signal_badges=[],
+    )
+
+    # 2-source corroborated cluster (hn + lobsters) with higher velocity
+    dual_hn = DigestFeedItem(
+        external_id="20",
+        feed_provider="hn",
+        title="Linux 6.16 eBPF Verifier Rewrite",
+        url="https://lwn.net/Articles/616000/",
+        velocity=25.0,
+        signal_badges=["breakout"],
+    )
+    dual_lobsters = DigestFeedItem(
+        external_id="lob-20",
+        feed_provider="lobsters",
+        title="Linux 6.16 eBPF Verifier Rewrite",
+        url="https://lwn.net/Articles/616000/",
+        velocity=10.0,
+        signal_badges=[],
+    )
+
+    # Single-source high-velocity cluster (HN only, 2 items -> still not corroborated)
+    single_hi_1 = DigestFeedItem(
+        external_id="30",
+        feed_provider="hn",
+        title="Show HN: Tiny Zig HTTP Server",
+        url="https://example.org/zig-http",
+        velocity=40.0,
+        signal_badges=["breakout"],
+    )
+    single_hi_2 = DigestFeedItem(
+        external_id="31",
+        feed_provider="hn",
+        title="Tiny Zig HTTP Server Benchmarks",
+        url="https://example.org/zig-http?ref=hn",
+        velocity=5.0,
+        signal_badges=[],
+    )
+
+    # Single-source low-velocity cluster
+    single_lo = DigestFeedItem(
+        external_id="40",
+        feed_provider="hn",
+        title="Old Retro Computing Post",
+        url="https://example.org/retro",
+        velocity=2.0,
+        signal_badges=[],
+    )
+
+    # Cluster via cluster_related_stories() first to verify full pipeline
+    clusters = cluster_related_stories(
+        [single_lo, single_hi_1, single_hi_2, dual_hn, dual_lobsters, tri_hn, tri_lobsters, tri_github]
+    )
+    annotated = annotate_cross_source_clusters(clusters)
+
+    assert len(annotated) == 4
+
+    # 1st: 3-source corroborated cluster
+    first = annotated[0]
+    assert first["is_corroborated"] is True
+    assert first["sources"] == ["github", "hn", "lobsters"]
+    assert first["corroboration_count"] == 3
+    assert first["cluster_size"] == 3
+    assert first["max_velocity"] == pytest.approx(12.5)
+    assert first["primary"].external_id == "10"
+    for item in first["items"]:
+        assert "corroborated" in item.signal_badges
+        assert item.signal_badges.count("corroborated") == 1
+
+    # 2nd: 2-source corroborated cluster
+    second = annotated[1]
+    assert second["is_corroborated"] is True
+    assert second["sources"] == ["hn", "lobsters"]
+    assert second["corroboration_count"] == 2
+    assert second["cluster_size"] == 2
+    assert second["max_velocity"] == pytest.approx(25.0)
+    assert "corroborated" in second["primary"].signal_badges
+
+    # 3rd: Single-source high-velocity cluster (beats low-velocity single-source)
+    third = annotated[2]
+    assert third["is_corroborated"] is False
+    assert third["sources"] == ["hn"]
+    assert third["corroboration_count"] == 1
+    assert third["cluster_size"] == 2
+    assert third["max_velocity"] == pytest.approx(40.0)
+    for item in third["items"]:
+        assert "corroborated" not in item.signal_badges
+
+    # 4th: Single-source low-velocity cluster
+    fourth = annotated[3]
+    assert fourth["is_corroborated"] is False
+    assert fourth["max_velocity"] == pytest.approx(2.0)
+
+    # Original caller objects were NOT mutated
+    assert "corroborated" not in tri_hn.signal_badges
+    assert "corroborated" not in tri_github.signal_badges
+    assert "corroborated" not in dual_hn.signal_badges
