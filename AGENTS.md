@@ -160,8 +160,8 @@ Compound topic research pipeline: searches both the local SQLite FTS5 archive an
 * **`include_comments`** (`boolean`, optional, default: `true`): Whether to synthesize HN community comments for each story.
 
 ### `hn_briefing`
-Synthesize Hacker News developments into an Executive Technology Briefing with thematic clustering, signal badges, SimHash event clustering, optional focus re-ranking, and snapshot deltas.
-* **`feed_id`** (`string`, optional, default: `"hn_top"`): One of `"hn_top"`, `"hn_new"`, `"hn_best"`, `"hn_ask"`, `"hn_show"`.
+Synthesize multi-sensor tech developments into an Executive Technology Briefing with thematic clustering, signal badges, SimHash event clustering, optional focus re-ranking, and snapshot deltas.
+* **`feed_id`** (`string`, optional, default: `"hn_top"`): One of `"hn_top"`, `"hn_new"`, `"hn_best"`, `"hn_ask"`, `"hn_show"`, `"lobsters_hot"`, `"lobsters_new"`, `"github_trending"`.
 * **`limit`** (`integer`, optional, default: `10`): Number of stories to include.
 * **`locale`** (`string`, optional, default: `"th"`): Language ISO code (`"th"` or `"en"`).
 * **`focus`** (`string`, optional): BM25 focus topic to prioritize relevant stories.

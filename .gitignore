@@ -45,6 +45,8 @@ htmlcov/
 # Local databases, caches & secrets
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 .env

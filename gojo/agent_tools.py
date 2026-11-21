@@ -374,6 +374,8 @@ def format_radar_for_agent(
             )
         for it in c_items:
             eid = it.get("external_id")
+            provider = it.get("feed_provider") or "hn"
+            id_label = f"{provider}:{eid}" if provider and provider != "hn" else f"{eid}"
             title = it.get("title") or "Untitled"
             score = it.get("score") or 0
             comments = it.get("descendants") or 0
@@ -382,7 +384,7 @@ def format_radar_for_agent(
             badge_str = f" [{', '.join(badges)}]" if badges else ""
             vel_str = f", Vel: {vel:.1f}" if isinstance(vel, (int, float)) else ""
             lines.append(
-                f"- [ID: {eid}] {title} (Score: {score}, Comments: {comments}{vel_str}){badge_str}"
+                f"- [ID: {id_label}] {title} (Score: {score}, Comments: {comments}{vel_str}){badge_str}"
             )
             if it.get("url"):
                 lines.append(f"  URL: {it.get('url')}")
