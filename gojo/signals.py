@@ -4,7 +4,9 @@ Six Eyes Signal Engine — Pure-Python, zero-dependency intelligence primitives:
 - URL canonicalization (tracking-parameter & fragment stripping)
 - 64-bit deterministic SimHash & Hamming distance for near-duplicate detection
 - Event-level story clustering (URL match, Jaccard overlap, SimHash proximity)
+- Cross-source corroboration scoring & badge annotation across independent sensors
 - Local Okapi BM25 focus-profile relevance ranking (zero LLM token cost)
+- Adaptive focus profile derivation from local summary history
 """
 
 from __future__ import annotations
@@ -20,6 +22,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .types import DigestFeedItem
 
 _TOKEN_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
+_PROFILE_TOKEN_RE = re.compile(
+    r"[a-zA-Z0-9]+(?:[+#][a-zA-Z0-9+#]*)*|[^\W_]+",
+    flags=re.UNICODE,
+)
 
 _STOPWORDS: frozenset[str] = frozenset(
     {
@@ -95,6 +101,127 @@ _STOPWORDS: frozenset[str] = frozenset(
         "with",
         "you",
         "your",
+    }
+)
+
+_PROFILE_STOPWORDS: frozenset[str] = _STOPWORDS | frozenset(
+    {
+        "about",
+        "after",
+        "all",
+        "also",
+        "announced",
+        "announcement",
+        "announcing",
+        "any",
+        "article",
+        "author",
+        "based",
+        "because",
+        "before",
+        "being",
+        "between",
+        "blog",
+        "both",
+        "build",
+        "building",
+        "built",
+        "com",
+        "comment",
+        "comments",
+        "could",
+        "did",
+        "discussion",
+        "does",
+        "during",
+        "each",
+        "even",
+        "every",
+        "example",
+        "first",
+        "good",
+        "great",
+        "guide",
+        "hacker",
+        "had",
+        "having",
+        "here",
+        "however",
+        "http",
+        "https",
+        "instead",
+        "introducing",
+        "introduction",
+        "io",
+        "last",
+        "launch",
+        "launched",
+        "like",
+        "link",
+        "make",
+        "makes",
+        "making",
+        "many",
+        "may",
+        "might",
+        "most",
+        "much",
+        "must",
+        "need",
+        "net",
+        "news",
+        "note",
+        "only",
+        "org",
+        "other",
+        "overview",
+        "own",
+        "page",
+        "people",
+        "post",
+        "read",
+        "really",
+        "release",
+        "released",
+        "same",
+        "says",
+        "see",
+        "should",
+        "since",
+        "site",
+        "still",
+        "story",
+        "such",
+        "summary",
+        "take",
+        "takeaway",
+        "thing",
+        "things",
+        "think",
+        "those",
+        "thread",
+        "through",
+        "time",
+        "too",
+        "two",
+        "under",
+        "update",
+        "used",
+        "very",
+        "via",
+        "want",
+        "way",
+        "well",
+        "while",
+        "within",
+        "without",
+        "work",
+        "working",
+        "works",
+        "would",
+        "www",
+        "year",
+        "years",
     }
 )
 
@@ -423,3 +550,148 @@ def rank_items_by_focus(
 
     scored.sort(key=lambda row: (-row[2], row[0]))
     return [(item, score) for _, item, score in scored]
+
+
+def _tokenize_profile(text: str) -> list[str]:
+    """Tokenize text for adaptive focus profiling while preserving short tech tokens."""
+    tokens = [m.group(0).lower() for m in _PROFILE_TOKEN_RE.finditer(text or "")]
+    return [
+        tok
+        for tok in tokens
+        if len(tok) >= 2 and any(ch.isalpha() for ch in tok) and tok not in _PROFILE_STOPWORDS
+    ]
+
+
+def build_adaptive_focus_profile(
+    corpus: list[dict[str, str]],
+    *,
+    top_terms: int = 20,
+    decay: float = 0.92,
+) -> list[tuple[str, float]]:
+    """
+    Build a weighted adaptive focus profile from newest-first local summary history.
+
+    Each corpus item is a lightweight dict (``{"title": ..., "key_takeaway": ...,
+    "source_url": ...}``). Title tokens receive weight 2.0 and ``key_takeaway`` tokens
+    receive weight 1.0, scaled by smooth recency decay (``decay ** idx``) and smooth
+    IDF weighting across documents.
+    """
+    if not corpus or top_terms <= 0:
+        return []
+
+    eff_decay = max(0.0, float(decay))
+    n_docs = len(corpus)
+    weighted_tf: dict[str, float] = {}
+    doc_freq: Counter[str] = Counter()
+
+    for idx, entry in enumerate(corpus):
+        if not isinstance(entry, dict):
+            continue
+        recency = eff_decay**idx
+        title_tokens = _tokenize_profile(str(entry.get("title") or ""))
+        takeaway_tokens = _tokenize_profile(str(entry.get("key_takeaway") or ""))
+        if not title_tokens and not takeaway_tokens:
+            continue
+
+        seen_in_doc: set[str] = set()
+        for tok in title_tokens:
+            weighted_tf[tok] = weighted_tf.get(tok, 0.0) + 2.0 * recency
+            seen_in_doc.add(tok)
+        for tok in takeaway_tokens:
+            weighted_tf[tok] = weighted_tf.get(tok, 0.0) + 1.0 * recency
+            seen_in_doc.add(tok)
+
+        for tok in seen_in_doc:
+            doc_freq[tok] += 1
+
+    if not weighted_tf:
+        return []
+
+    scored: list[tuple[str, float]] = []
+    for term, tf_weight in weighted_tf.items():
+        idf = 1.0 + math.log((n_docs + 1.0) / (doc_freq[term] + 1.0))
+        scored.append((term, round(tf_weight * idf, 6)))
+
+    scored.sort(key=lambda pair: (-pair[1], pair[0]))
+    return scored[:top_terms]
+
+
+def profile_to_focus_query(
+    profile: list[tuple[str, float]],
+    *,
+    max_terms: int = 12,
+) -> str:
+    """
+    Join top ``max_terms`` terms from an adaptive focus profile into a space-separated
+    query string compatible with ``rank_items_by_focus()``.
+    """
+    if not profile or max_terms <= 0:
+        return ""
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term, _weight in profile:
+        cleaned = str(term or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        terms.append(cleaned)
+        if len(terms) >= max_terms:
+            break
+    return " ".join(terms)
+
+
+def annotate_cross_source_clusters(
+    clusters: list[list[DigestFeedItem]],
+) -> list[dict[str, Any]]:
+    """
+    Annotate story clusters with cross-source corroboration metadata and badges.
+
+    Computes distinct ``feed_provider`` sources per cluster, marks ``is_corroborated``
+    when 2+ independent sources are present (e.g. ``hn``, ``lobsters``, ``github``),
+    appends ``"corroborated"`` to each item's ``signal_badges`` on shallow copies
+    without mutating inputs, and sorts corroborated multi-sensor clusters first,
+    followed by highest ``max_velocity`` and ``cluster_size``.
+    """
+    if not clusters:
+        return []
+
+    annotated: list[tuple[int, dict[str, Any]]] = []
+    for idx, cluster in enumerate(clusters):
+        if not cluster:
+            continue
+
+        sources = sorted({it.feed_provider for it in cluster if it.feed_provider})
+        is_corroborated = len(sources) >= 2
+
+        updated_items: list[DigestFeedItem] = []
+        for it in cluster:
+            badges = list(it.signal_badges or [])
+            if is_corroborated and "corroborated" not in badges:
+                badges.append("corroborated")
+            updated_items.append(it.model_copy(update={"signal_badges": badges}))
+
+        velocities = [float(it.velocity) for it in updated_items if it.velocity is not None]
+        max_velocity = round(max(velocities), 4) if velocities else 0.0
+
+        summary: dict[str, Any] = {
+            "primary": updated_items[0],
+            "items": updated_items,
+            "sources": sources,
+            "corroboration_count": len(sources),
+            "is_corroborated": is_corroborated,
+            "cluster_size": len(updated_items),
+            "max_velocity": max_velocity,
+        }
+        annotated.append((idx, summary))
+
+    annotated.sort(
+        key=lambda row: (
+            0 if row[1]["is_corroborated"] else 1,
+            -row[1]["corroboration_count"] if row[1]["is_corroborated"] else 0,
+            -row[1]["max_velocity"],
+            -row[1]["cluster_size"],
+            row[0],
+        )
+    )
+    return [summary for _, summary in annotated]
