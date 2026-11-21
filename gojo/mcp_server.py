@@ -19,6 +19,7 @@ from .agent_tools import (
     format_radar_for_agent,
     format_search_for_agent,
     format_summary_for_agent,
+    format_topic_pulse_for_agent,
     tool_briefing_hn,
     tool_deep_dive_hn,
     tool_get_artifact,
@@ -28,6 +29,7 @@ from .agent_tools import (
     tool_search_hn,
     tool_search_hn_full,
     tool_summarize_hn,
+    tool_topic_pulse,
 )
 from .providers.llm import AutoLLMProvider, OllamaProvider
 from .service import GojoHNService
@@ -52,12 +54,13 @@ def create_mcp_server(
     service_factory: Callable[[], GojoHNService] = GojoHNService,
 ) -> Any:
     """
-    Create and configure a FastMCP server exposing all 9 Gojo Hacker News tools,
+    Create and configure a FastMCP server exposing all 10 Gojo Six Eyes tools,
     plus reusable MCP prompts and resources when supported by FastMCP:
     Tools:
     - hn_search
     - hn_search_full
     - hn_radar
+    - hn_topic_pulse
     - hn_summarize
     - hn_deep_dive
     - hn_briefing
@@ -67,9 +70,11 @@ def create_mcp_server(
     Prompts:
     - morning_tech_radar
     - topic_deep_dive
+    - adaptive_briefing
     Resources:
     - gojo://providers
     - gojo://archive/recent
+    - gojo://profile/focus
     """
     FastMCP = _import_fastmcp()
     mcp = FastMCP(name)
@@ -117,14 +122,34 @@ def create_mcp_server(
         top_n: int = 10,
         focus: str | None = None,
         badges: list[str] | None = None,
+        personalized: bool = False,
+        include_sensors: bool = False,
         max_chars: int | None = None,
     ) -> str:
-        """Zero-LLM-token Six Eyes Signal Radar across multiple HN feeds with clustering and badges."""
+        """Zero-LLM-token Six Eyes Signal Radar across HN and optional multi-sensor feeds with adaptive focus and corroboration."""
         svc = _get_service()
         res = await tool_radar_hn(
-            svc, feeds=feeds, top_n=top_n, focus=focus, badges=badges
+            svc,
+            feeds=feeds,
+            top_n=top_n,
+            focus=focus,
+            badges=badges,
+            personalized=personalized,
+            include_sensors=include_sensors,
         )
         return format_radar_for_agent(res, max_chars=max_chars)
+
+    @mcp.tool()
+    async def hn_topic_pulse(
+        topic: str,
+        days: int = 30,
+        limit: int = 50,
+        max_chars: int | None = None,
+    ) -> str:
+        """Track historical topic momentum, score deltas, debate ratio, and archived takeaways over a lookback window."""
+        svc = _get_service()
+        res = await tool_topic_pulse(svc, topic=topic, days=days, limit=limit)
+        return format_topic_pulse_for_agent(res, max_chars=max_chars)
 
     @mcp.tool()
     async def hn_summarize(
@@ -243,6 +268,19 @@ def create_mcp_server(
                 "Keep the brief direct, specific, and free of filler."
             )
 
+        @mcp.prompt()
+        def adaptive_briefing() -> str:
+            """Personalized multi-sensor Six Eyes briefing workflow prompt."""
+            return (
+                "Inspect `gojo://profile/focus` to review the learned adaptive focus terms, "
+                "then run `hn_radar` with `personalized=True` and `include_sensors=True` to "
+                "surface cross-source corroborated clusters across Hacker News, Lobste.rs, and "
+                "GitHub Trending at zero LLM token cost. For the top 1-2 recurring themes, "
+                "call `hn_topic_pulse` (days=30) to verify whether momentum is rising, steady, "
+                "or cooling, and call `hn_summarize` (summary_type='technical') on the highest-signal "
+                "corroborated stories. Deliver a direct engineering brief without hype or filler."
+            )
+
     if hasattr(mcp, "resource"):
         @mcp.resource("gojo://providers")
         async def resource_providers() -> str:
@@ -285,6 +323,13 @@ def create_mcp_server(
                 indent=2,
                 ensure_ascii=False,
             )
+
+        @mcp.resource("gojo://profile/focus")
+        async def resource_profile_focus() -> str:
+            """Return the learned adaptive focus profile from recent summary history as JSON."""
+            svc = _get_service()
+            profile = await svc.get_adaptive_focus_profile()
+            return json.dumps(profile, indent=2, ensure_ascii=False)
 
     return mcp
 

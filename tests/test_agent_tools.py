@@ -12,6 +12,7 @@ from gojo.agent_tools import (
     format_radar_for_agent,
     format_search_for_agent,
     format_summary_for_agent,
+    format_topic_pulse_for_agent,
     tool_briefing_hn,
     tool_deep_dive_hn,
     tool_get_artifact,
@@ -21,9 +22,11 @@ from gojo.agent_tools import (
     tool_search_hn,
     tool_search_hn_full,
     tool_summarize_hn,
+    tool_topic_pulse,
 )
 from gojo.cli import build_parser
 from gojo.types import (
+    ALL_SUPPORTED_FEED_IDS,
     DigestArtifact,
     DigestCompletion,
     DigestFeedItem,
@@ -47,12 +50,13 @@ def test_filter_items_by_query() -> None:
 
 
 def test_agent_tool_definitions_valid() -> None:
-    assert len(HN_AGENT_TOOL_DEFINITIONS) == 9
+    assert len(HN_AGENT_TOOL_DEFINITIONS) == 10
     by_name = {t["function"]["name"]: t["function"] for t in HN_AGENT_TOOL_DEFINITIONS}
     assert set(by_name.keys()) == {
         "hn_search",
         "hn_search_full",
         "hn_radar",
+        "hn_topic_pulse",
         "hn_summarize",
         "hn_deep_dive",
         "hn_briefing",
@@ -61,10 +65,18 @@ def test_agent_tool_definitions_valid() -> None:
         "hn_get_artifact",
     }
 
-    # Verify reconciled defaults and 5-feed enum
+    # Verify reconciled defaults and 8-feed multi-sensor enum
     search_feeds = by_name["hn_search"]["parameters"]["properties"]["feed_id"]["enum"]
-    assert set(search_feeds) == {"hn_top", "hn_new", "hn_best", "hn_ask", "hn_show"}
+    assert set(search_feeds) == set(ALL_SUPPORTED_FEED_IDS)
     assert "focus" in by_name["hn_search"]["parameters"]["properties"]
+
+    radar_props = by_name["hn_radar"]["parameters"]["properties"]
+    assert set(radar_props["feeds"]["items"]["enum"]) == set(ALL_SUPPORTED_FEED_IDS)
+    assert "personalized" in radar_props
+    assert "include_sensors" in radar_props
+    assert "corroborated" in radar_props["badges"]["items"]["enum"]
+
+    assert by_name["hn_topic_pulse"]["parameters"]["required"] == ["topic"]
     assert by_name["hn_briefing"]["parameters"]["properties"]["locale"]["default"] == "th"
     assert by_name["hn_search_full"]["parameters"]["required"] == ["query"]
     assert by_name["hn_deep_dive"]["parameters"]["required"] == ["topic"]
@@ -403,9 +415,9 @@ async def test_gojo_agent_toolkit_schemas_and_lifecycle() -> None:
         anthropic_schemas = kit.schemas("anthropic")
         gemini_schemas = kit.schemas("gemini")
 
-        assert len(openai_schemas) == 9
-        assert len(anthropic_schemas) == 9
-        assert len(gemini_schemas) == 9
+        assert len(openai_schemas) == 10
+        assert len(anthropic_schemas) == 10
+        assert len(gemini_schemas) == 10
 
         assert openai_schemas[0]["type"] == "function"
         assert "function" in openai_schemas[0]
@@ -558,6 +570,23 @@ async def test_mcp_server_prompts_resources_and_9_tools() -> None:
     )
     mock_svc = AsyncMock()
     mock_svc.list_recent_artifacts.return_value = [art]
+    mock_svc.get_adaptive_focus_profile.return_value = {
+        "terms": [{"term": "rust", "weight": 4.2}, {"term": "sqlite", "weight": 2.8}],
+        "focus_query": "rust sqlite",
+        "corpus_size": 2,
+    }
+    mock_svc.topic_pulse.return_value = {
+        "topic": "rust",
+        "window_days": 30,
+        "distinct_stories": 2,
+        "total_snapshots": 3,
+        "peak_score": 410,
+        "avg_score": 320.0,
+        "avg_debate_ratio": 0.45,
+        "trend_direction": "rising",
+        "timeline_stories": [],
+        "archived_takeaways": [],
+    }
     mock_svc.radar.return_value = {
         "feeds_scanned": ["hn_top"],
         "total_scanned": 1,
@@ -570,23 +599,43 @@ async def test_mcp_server_prompts_resources_and_9_tools() -> None:
     with patch.object(mcp_mod, "_import_fastmcp", return_value=_FullFakeFastMCP):
         server = mcp_mod.create_mcp_server(service_factory=lambda: mock_svc)
 
-    # All 9 tools registered
-    assert len(server.tools) == 9
-    assert {"hn_search_full", "hn_radar", "hn_deep_dive"}.issubset(server.tools.keys())
+    # All 10 tools registered
+    assert len(server.tools) == 10
+    assert {"hn_search_full", "hn_radar", "hn_topic_pulse", "hn_deep_dive"}.issubset(
+        server.tools.keys()
+    )
+    pulse_text = await server.tools["hn_topic_pulse"](topic="rust", days=30, limit=20)
+    assert "# Topic Pulse: rust" in pulse_text
+    assert "Trend: rising" in pulse_text
 
-    # Prompts registered and return concise anti-slop text
-    assert set(server.prompts.keys()) == {"morning_tech_radar", "topic_deep_dive"}
+    # 3 Prompts registered and return concise anti-slop text
+    assert set(server.prompts.keys()) == {
+        "morning_tech_radar",
+        "topic_deep_dive",
+        "adaptive_briefing",
+    }
     p1 = server.prompts["morning_tech_radar"](focus="rust")
     assert "hn_radar" in p1 and "rust" in p1
     p2 = server.prompts["topic_deep_dive"](topic="sqlite")
     assert "hn_deep_dive" in p2 and "sqlite" in p2
+    p3 = server.prompts["adaptive_briefing"]()
+    assert "gojo://profile/focus" in p3 and "hn_topic_pulse" in p3
 
-    # Resources registered
-    assert set(server.resources.keys()) == {"gojo://providers", "gojo://archive/recent"}
+    # 3 Resources registered
+    assert set(server.resources.keys()) == {
+        "gojo://providers",
+        "gojo://archive/recent",
+        "gojo://profile/focus",
+    }
     recent_json = await server.resources["gojo://archive/recent"]()
     recent_data = json.loads(recent_json)
     assert len(recent_data) == 1
     assert recent_data[0]["title"] == "Recent Cached Story"
+
+    focus_json = await server.resources["gojo://profile/focus"]()
+    focus_data = json.loads(focus_json)
+    assert focus_data["focus_query"] == "rust sqlite"
+    assert focus_data["corpus_size"] == 2
 
     with (
         patch.object(mcp_mod.OllamaProvider, "is_available", new_callable=AsyncMock, return_value=False),
@@ -607,23 +656,59 @@ def test_cli_parser_supercommands_and_exports() -> None:
         "GojoAgentToolkit",
         "tool_search_hn_full",
         "tool_radar_hn",
+        "tool_topic_pulse",
         "tool_deep_dive_hn",
         "format_radar_for_agent",
+        "format_topic_pulse_for_agent",
         "format_deep_dive_for_agent",
+        "LobstersFeedSource",
+        "GitHubTrendingFeedSource",
+        "ALL_SUPPORTED_FEED_IDS",
+        "build_adaptive_focus_profile",
+        "annotate_cross_source_clusters",
     ):
         assert hasattr(gojo, sym)
 
     parser = build_parser()
 
+    args_list_lob = parser.parse_args(["list", "--feed", "lobsters_hot", "--json"])
+    assert args_list_lob.feed == "lobsters_hot"
+
+    args_list_gh = parser.parse_args(["list", "--feed", "github_trending"])
+    assert args_list_gh.feed == "github_trending"
+
     args_radar = parser.parse_args(
-        ["radar", "--feeds", "top", "best", "--top", "7", "--focus", "ai", "--badges", "breakout", "--json"]
+        [
+            "radar",
+            "--feeds",
+            "top",
+            "best",
+            "--top",
+            "7",
+            "--focus",
+            "ai",
+            "--badges",
+            "breakout",
+            "--personalized",
+            "--multi-sensor",
+            "--json",
+        ]
     )
     assert args_radar.command == "radar"
     assert args_radar.feeds == ["top", "best"]
     assert args_radar.top == 7
     assert args_radar.focus == "ai"
     assert args_radar.badges == ["breakout"]
+    assert args_radar.personalized is True
+    assert args_radar.multi_sensor is True
     assert args_radar.json is True
+
+    args_pulse = parser.parse_args(["pulse", "rust async", "--days", "14", "--limit", "25", "--json"])
+    assert args_pulse.command == "pulse"
+    assert args_pulse.topic == "rust async"
+    assert args_pulse.days == 14
+    assert args_pulse.limit == 25
+    assert args_pulse.json is True
 
     args_hn_arch = parser.parse_args(["hn-archive", "ebpf", "--limit", "12", "--sort", "date", "--json"])
     assert args_hn_arch.command == "hn-archive"
@@ -641,3 +726,119 @@ def test_cli_parser_supercommands_and_exports() -> None:
     assert args_dd.type == "bullet"
     assert args_dd.locale == "th"
     assert args_dd.json is True
+
+
+@pytest.mark.asyncio
+async def test_topic_pulse_tool_formatter_and_radar_corroboration_format() -> None:
+    mock_svc = AsyncMock()
+    mock_svc.topic_pulse.return_value = {
+        "topic": "ebpf",
+        "window_days": 30,
+        "distinct_stories": 2,
+        "total_snapshots": 4,
+        "peak_score": 520,
+        "avg_score": 390.0,
+        "avg_debate_ratio": 0.62,
+        "trend_direction": "rising",
+        "timeline_stories": [
+            {
+                "external_id": "901",
+                "feed_id": "hn_top",
+                "title": "eBPF Packet Filtering at 100Gbps",
+                "url": "https://example.com/ebpf",
+                "latest_score": 520,
+                "score_delta": 120,
+                "latest_descendants": 180,
+            }
+        ],
+        "archived_takeaways": [
+            {
+                "artifact_id": "art-901",
+                "external_id": "901",
+                "title": "eBPF Packet Filtering at 100Gbps",
+                "key_takeaway": "XDP bypasses sk_buff allocation.",
+                "community_consensus": "Strong production adoption.",
+            }
+        ],
+    }
+
+    pulse_out = await tool_topic_pulse(mock_svc, topic="ebpf", days=30, limit=20)
+    assert pulse_out["trend_direction"] == "rising"
+    fmt_pulse = format_topic_pulse_for_agent(pulse_out)
+    assert "# Topic Pulse: ebpf (30d window)" in fmt_pulse
+    assert "eBPF Packet Filtering at 100Gbps" in fmt_pulse
+    assert "Δ+120" in fmt_pulse
+    assert "XDP bypasses sk_buff allocation." in fmt_pulse
+    assert len(format_topic_pulse_for_agent(pulse_out, max_chars=80)) <= 80
+
+    async with GojoAgentToolkit(service=mock_svc) as kit:
+        dispatched = await kit.dispatch("hn_topic_pulse", {"topic": "ebpf", "days": 30}, as_text=True)
+        assert isinstance(dispatched, str)
+        assert "Topic Pulse: ebpf" in dispatched
+
+    radar_payload = {
+        "feeds_scanned": ["hn_top", "lobsters_hot", "github_trending"],
+        "total_scanned": 12,
+        "focus_applied": "rust kernel",
+        "badges_filter": [],
+        "personalized_applied": True,
+        "learned_focus_terms": ["rust", "kernel", "ebpf"],
+        "sensor_errors": [{"feed_id": "github_trending", "error": "rate limited"}],
+        "top_items": [
+            {
+                "feed_provider": "hn",
+                "external_id": "10",
+                "title": "Rust Kernel Allocator",
+                "score": 300,
+                "descendants": 90,
+                "velocity": 30.0,
+                "signal_badges": ["breakout", "corroborated"],
+                "url": "https://example.com/rust-alloc",
+            }
+        ],
+        "corroborated_clusters": [
+            {
+                "cluster_id": 1,
+                "size": 2,
+                "sources": ["hn", "lobsters"],
+                "is_corroborated": True,
+                "items": [
+                    {
+                        "feed_provider": "hn",
+                        "external_id": "10",
+                        "title": "Rust Kernel Allocator",
+                        "score": 300,
+                        "descendants": 90,
+                        "velocity": 30.0,
+                        "signal_badges": ["breakout", "corroborated"],
+                        "url": "https://example.com/rust-alloc",
+                    },
+                    {
+                        "feed_provider": "lobsters",
+                        "external_id": "abc123",
+                        "title": "Rust Kernel Allocator",
+                        "score": 45,
+                        "descendants": 12,
+                        "velocity": 8.0,
+                        "signal_badges": ["rising", "corroborated"],
+                        "url": "https://example.com/rust-alloc",
+                    },
+                ],
+            }
+        ],
+        "clusters": [
+            {
+                "cluster_id": 1,
+                "size": 2,
+                "sources": ["hn", "lobsters"],
+                "is_corroborated": True,
+                "items": [],
+            }
+        ],
+    }
+    fmt_radar = format_radar_for_agent(radar_payload)
+    assert "Corroborated Multi-Sensor Clusters" in fmt_radar
+    assert "Learned Focus Terms: rust, kernel, ebpf" in fmt_radar
+    assert "Adaptive Focus: ON" in fmt_radar
+    assert "Sensor Warnings" in fmt_radar
+    assert "github_trending" in fmt_radar

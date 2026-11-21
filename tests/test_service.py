@@ -7,7 +7,7 @@ import pytest
 
 from gojo.service import GojoHNService, _prefer_main_html, _strip_html
 from gojo.storage.memory import MemoryStorage
-from gojo.types import DigestFeedItem
+from gojo.types import DigestArtifact, DigestFeedItem
 
 
 def test_html_helpers() -> None:
@@ -577,3 +577,259 @@ async def test_service_deep_dive_concurrent_cache_and_partial_errors() -> None:
     assert len(dossier["local_archive_matches"]) >= 1
     assert len(dossier["errors"]) == 1
     assert dossier["errors"][0]["external_id"] == "203"
+
+
+@pytest.mark.asyncio
+async def test_service_multi_sensor_list_feed_and_close() -> None:
+    storage = MemoryStorage()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    mock_hn = AsyncMock()
+    mock_hn.provider_id = "hn"
+
+    mock_lobsters = AsyncMock()
+    mock_lobsters.provider_id = "lobsters"
+    mock_lobsters.list_page.return_value = (
+        [
+            DigestFeedItem(
+                feed_provider="lobsters",
+                external_id="lob123",
+                title="Zig Comptime Memory Allocators",
+                url="https://example.com/zig-alloc",
+                score=85,
+                descendants=30,
+                time=now_ts - 1800,
+            )
+        ],
+        False,
+    )
+
+    mock_github = AsyncMock()
+    mock_github.provider_id = "github"
+    mock_github.list_page.return_value = (
+        [
+            DigestFeedItem(
+                feed_provider="github",
+                external_id="org/fast-kv",
+                title="org/fast-kv — Zero-copy LSM storage engine",
+                url="https://github.com/org/fast-kv",
+                score=420,
+                descendants=15,
+                time=now_ts - 3600,
+            )
+        ],
+        True,
+    )
+
+    async with GojoHNService(
+        feed_source=mock_hn,
+        lobsters_source=mock_lobsters,
+        github_source=mock_github,
+        storage=storage,
+    ) as svc:
+        lob_res = await svc.list_feed(feed_id="lobsters_hot", page=1, page_size=10)
+        assert lob_res.feed_id == "lobsters_hot"
+        assert len(lob_res.items) == 1
+        assert lob_res.items[0].feed_provider == "lobsters"
+        assert lob_res.items[0].velocity is not None
+        mock_lobsters.list_page.assert_awaited_once_with(feed_variant="hot", page=1, page_size=10)
+
+        # Second call hits cache
+        lob_cached = await svc.list_feed(feed_id="lobsters_hot", page=1, page_size=10)
+        assert lob_cached.completion.cache_layer == "memory"
+        assert mock_lobsters.list_page.await_count == 1
+
+        gh_res = await svc.list_feed(feed_id="github_trending", page=1, page_size=10)
+        assert gh_res.feed_id == "github_trending"
+        assert gh_res.has_more is True
+        assert gh_res.items[0].feed_provider == "github"
+        assert gh_res.items[0].velocity is not None
+        mock_github.list_page.assert_awaited_once_with(
+            feed_variant="github_trending", page=1, page_size=10
+        )
+
+        # Snapshots recorded for multi-sensor stories
+        snaps = await storage.get_latest_snapshots(["lob123", "org/fast-kv"])
+        assert "lob123" in snaps
+        assert "org/fast-kv" in snaps
+
+        with pytest.raises(ValueError, match="lobsters_hot"):
+            await svc.list_feed(feed_id="unknown_sensor")
+
+    mock_hn.close.assert_awaited_once()
+    mock_lobsters.close.assert_awaited_once()
+    mock_github.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_radar_personalized_multi_sensor_corroboration_and_flaky_resilience() -> None:
+    storage = MemoryStorage()
+    now_dt = datetime.now(timezone.utc)
+    now_ts = int(now_dt.timestamp())
+
+    # Seed local archive so adaptive focus profile learns "rust" and "kernel"
+    await storage.save_artifact(
+        DigestArtifact(
+            fingerprint="f" * 64,
+            feed_provider="hn",
+            external_id="seed-1",
+            title="Rust Kernel Driver Architecture in Linux 6.12",
+            locale="en",
+            prompt_version="v5",
+            summary_markdown="## Summary\nRust kernel drivers reduce memory safety bugs.",
+            summary_extra={"key_takeaway": "Rust kernel abstractions stabilize DMA safety."},
+            created_at=now_dt,
+        )
+    )
+    await storage.save_artifact(
+        DigestArtifact(
+            fingerprint="e" * 64,
+            feed_provider="hn",
+            external_id="seed-2",
+            title="Zero-Copy Rust Kernel Scheduler Benchmarks",
+            locale="en",
+            prompt_version="v5",
+            summary_markdown="## Summary\nKernel scheduler improvements in Rust.",
+            summary_extra={"key_takeaway": "Rust kernel scheduler cuts tail latency."},
+            created_at=now_dt - timedelta(hours=1),
+        )
+    )
+
+    shared_url = "https://example.com/rust-kernel-dma"
+    hn_item = DigestFeedItem(
+        feed_provider="hn",
+        external_id="8001",
+        title="Rust Kernel DMA Allocator Deep Dive",
+        url=f"{shared_url}?utm_source=hn",
+        score=260,
+        descendants=95,
+        time=now_ts - 1800,
+    )
+    other_item = DigestFeedItem(
+        feed_provider="hn",
+        external_id="8002",
+        title="Sourdough Baking Temperature Guide",
+        url="https://example.com/sourdough",
+        score=120,
+        descendants=20,
+        time=now_ts - 3600,
+    )
+    lobsters_item = DigestFeedItem(
+        feed_provider="lobsters",
+        external_id="lob8001",
+        title="Rust Kernel DMA Allocator Deep Dive",
+        url=shared_url,
+        score=60,
+        descendants=18,
+        time=now_ts - 1200,
+    )
+
+    mock_hn = AsyncMock()
+    mock_hn.provider_id = "hn"
+
+    async def fake_hn_list_page(feed_variant: str, page: int, page_size: int):
+        if feed_variant == "top":
+            return [other_item, hn_item], False
+        return [hn_item], False
+
+    mock_hn.list_page.side_effect = fake_hn_list_page
+
+    mock_lobsters = AsyncMock()
+    mock_lobsters.provider_id = "lobsters"
+    mock_lobsters.list_page.return_value = ([lobsters_item], False)
+
+    # Flaky GitHub sensor must not crash radar
+    mock_github = AsyncMock()
+    mock_github.provider_id = "github"
+    mock_github.list_page.side_effect = RuntimeError("GitHub API rate limit exceeded")
+
+    mock_llm = AsyncMock()
+
+    async with GojoHNService(
+        feed_source=mock_hn,
+        lobsters_source=mock_lobsters,
+        github_source=mock_github,
+        storage=storage,
+        llm_provider=mock_llm,
+    ) as svc:
+        profile = await svc.get_adaptive_focus_profile(limit=10, top_terms=10)
+        assert profile["corpus_size"] == 2
+        assert "rust" in profile["focus_query"]
+        assert "kernel" in profile["focus_query"]
+
+        res = await svc.radar(
+            top_n=5,
+            personalized=True,
+            include_sensors=True,
+        )
+
+    assert res["feeds_scanned"] == ["hn_top", "hn_best", "lobsters_hot", "github_trending"]
+    assert res["personalized_applied"] is True
+    assert "rust" in res["learned_focus_terms"]
+    assert len(res["sensor_errors"]) == 1
+    assert res["sensor_errors"][0]["feed_id"] == "github_trending"
+    assert "rate limit" in res["sensor_errors"][0]["error"]
+
+    # Corroborated cluster across hn + lobsters
+    assert len(res["corroborated_clusters"]) == 1
+    corr = res["corroborated_clusters"][0]
+    assert corr["is_corroborated"] is True
+    assert corr["sources"] == ["hn", "lobsters"]
+    assert corr["size"] == 2
+    assert all("corroborated" in it["signal_badges"] for it in corr["items"])
+
+    # Personalized focus ranks rust/kernel items ahead of sourdough
+    assert res["top_items"][0]["external_id"] in {"8001", "lob8001"}
+    assert "corroborated" in res["top_items"][0]["signal_badges"]
+    mock_llm.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_topic_pulse_delegates_to_storage() -> None:
+    storage = MemoryStorage()
+    now_dt = datetime.now(timezone.utc)
+
+    await storage.record_story_snapshots(
+        "hn_top",
+        [
+            DigestFeedItem(
+                feed_provider="hn",
+                external_id="9101",
+                title="eBPF XDP Firewall Benchmarks",
+                url="https://example.com/ebpf-xdp",
+                score=210,
+                descendants=70,
+            ),
+            DigestFeedItem(
+                feed_provider="lobsters",
+                external_id="lob9102",
+                title="Writing eBPF Programs in Rust",
+                url="https://example.com/ebpf-rust",
+                score=95,
+                descendants=25,
+            ),
+        ],
+    )
+    await storage.save_artifact(
+        DigestArtifact(
+            fingerprint="a" * 64,
+            feed_provider="hn",
+            external_id="9101",
+            title="eBPF XDP Firewall Benchmarks",
+            locale="en",
+            prompt_version="v5",
+            summary_markdown="## Summary\neBPF XDP processes packets at line rate.",
+            summary_extra={"key_takeaway": "XDP drops malicious traffic before sk_buff."},
+            created_at=now_dt,
+        )
+    )
+
+    async with GojoHNService(storage=storage) as svc:
+        pulse = await svc.topic_pulse(topic="ebpf", days=30, limit=10)
+
+    assert pulse["topic"] == "ebpf"
+    assert pulse["distinct_stories"] == 2
+    assert pulse["peak_score"] == 210
+    assert len(pulse["timeline_stories"]) == 2
+    assert len(pulse["archived_takeaways"]) == 1
+    assert pulse["archived_takeaways"][0]["external_id"] == "9101"

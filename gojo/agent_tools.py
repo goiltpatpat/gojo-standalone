@@ -10,10 +10,9 @@ import copy
 import json
 from typing import Any, Literal
 
-from .providers.hn import SUPPORTED_FEED_IDS
 from .service import GojoHNService
 from .signals import rank_items_by_focus
-from .types import DigestFeedItem
+from .types import ALL_SUPPORTED_FEED_IDS, DigestFeedItem
 
 
 def _apply_max_chars(text: str, max_chars: int | None) -> str:
@@ -167,14 +166,29 @@ async def tool_radar_hn(
     top_n: int = 10,
     focus: str | None = None,
     badges: list[str] | None = None,
+    personalized: bool = False,
+    include_sensors: bool = False,
 ) -> dict[str, Any]:
-    """Run the zero-LLM-token Six Eyes Signal Radar across HN feeds."""
+    """Run the zero-LLM-token Six Eyes Signal Radar across HN and optional multi-sensor feeds."""
     return await svc.radar(
         feeds=feeds,
         top_n=top_n,
         focus=focus,
         badges=badges,
+        personalized=personalized,
+        include_sensors=include_sensors,
     )
+
+
+async def tool_topic_pulse(
+    svc: GojoHNService,
+    *,
+    topic: str,
+    days: int = 30,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Track historical topic momentum, score deltas, debate ratio, and archived takeaways."""
+    return await svc.topic_pulse(topic=topic, days=days, limit=limit)
 
 
 async def tool_deep_dive_hn(
@@ -287,8 +301,12 @@ def format_radar_for_agent(
     total = out.get("total_scanned", 0)
     top_items = out.get("top_items") or []
     clusters = out.get("clusters") or []
+    corroborated_clusters = out.get("corroborated_clusters") or []
     focus = out.get("focus_applied")
     badges_filter = out.get("badges_filter") or []
+    personalized_applied = bool(out.get("personalized_applied"))
+    learned_terms = out.get("learned_focus_terms") or []
+    sensor_errors = out.get("sensor_errors") or []
 
     header_parts = [
         f"Six Eyes Radar | Feeds: {feeds}",
@@ -296,17 +314,59 @@ def format_radar_for_agent(
         f"Top: {len(top_items)}",
         f"Clusters: {len(clusters)}",
     ]
+    if corroborated_clusters:
+        header_parts.append(f"Corroborated: {len(corroborated_clusters)}")
     if focus:
         header_parts.append(f"Focus: {focus}")
+    if personalized_applied:
+        header_parts.append("Adaptive Focus: ON")
     if badges_filter:
         header_parts.append(f"Badges: {', '.join(badges_filter)}")
 
-    lines = [" | ".join(header_parts), ""]
+    lines = [" | ".join(header_parts)]
+    if learned_terms:
+        lines.append(f"Learned Focus Terms: {', '.join(learned_terms[:12])}")
+    lines.append("")
+
     if not top_items:
         lines.append("No stories matched the radar filters.")
+        if sensor_errors:
+            lines.append("")
+            lines.append("### Sensor Warnings")
+            for err in sensor_errors:
+                lines.append(f"- {err.get('feed_id')}: {err.get('error')}")
         return _apply_max_chars("\n".join(lines), max_chars)
 
+    if corroborated_clusters:
+        lines.append("## Corroborated Multi-Sensor Clusters")
+        for cluster in corroborated_clusters:
+            c_items = cluster.get("items") or []
+            sources = ", ".join(cluster.get("sources") or [])
+            lines.append(
+                f"### Corroborated Cluster {cluster.get('cluster_id')} "
+                f"({len(c_items)} stories across {sources})"
+            )
+            for it in c_items:
+                provider = it.get("feed_provider") or "hn"
+                eid = it.get("external_id")
+                title = it.get("title") or "Untitled"
+                score = it.get("score") or 0
+                comments = it.get("descendants") or 0
+                vel = it.get("velocity")
+                badges = it.get("signal_badges") or []
+                badge_str = f" [{', '.join(badges)}]" if badges else ""
+                vel_str = f", Vel: {vel:.1f}" if isinstance(vel, (int, float)) else ""
+                lines.append(
+                    f"- [{provider}:{eid}] {title} (Score: {score}, Comments: {comments}{vel_str}){badge_str}"
+                )
+                if it.get("url"):
+                    lines.append(f"  URL: {it.get('url')}")
+        lines.append("")
+
+    corroborated_ids = {c.get("cluster_id") for c in corroborated_clusters}
     for cluster in clusters:
+        if cluster.get("cluster_id") in corroborated_ids:
+            continue
         c_items = cluster.get("items") or []
         if len(c_items) > 1:
             lines.append(
@@ -326,7 +386,73 @@ def format_radar_for_agent(
             )
             if it.get("url"):
                 lines.append(f"  URL: {it.get('url')}")
-    return _apply_max_chars("\n".join(lines), max_chars)
+
+    if sensor_errors:
+        lines.append("")
+        lines.append("### Sensor Warnings")
+        for err in sensor_errors:
+            lines.append(f"- {err.get('feed_id')}: {err.get('error')}")
+
+    return _apply_max_chars("\n".join(lines).strip(), max_chars)
+
+
+def format_topic_pulse_for_agent(
+    out: dict[str, Any],
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """Format temporal topic pulse/timeline output as compact Markdown for LLM agent turns."""
+    topic = out.get("topic") or ""
+    window_days = out.get("window_days", 30)
+    trend = out.get("trend_direction") or "insufficient_data"
+    distinct = out.get("distinct_stories", 0)
+    total_snaps = out.get("total_snapshots", 0)
+    peak_score = out.get("peak_score", 0)
+    avg_score = out.get("avg_score", 0.0)
+    avg_debate = out.get("avg_debate_ratio", 0.0)
+    stories = out.get("timeline_stories") or []
+    takeaways = out.get("archived_takeaways") or []
+
+    lines = [
+        f"# Topic Pulse: {topic} ({window_days}d window)",
+        (
+            f"Trend: {trend} | Distinct Stories: {distinct} | Snapshots: {total_snaps} "
+            f"| Peak Score: {peak_score} | Avg Score: {avg_score} | Avg Debate Ratio: {avg_debate}"
+        ),
+        "",
+    ]
+
+    if stories:
+        lines.append("## Timeline Stories")
+        for st in stories:
+            eid = st.get("external_id")
+            feed_id = st.get("feed_id") or ""
+            title = st.get("title") or "Untitled"
+            latest_score = st.get("latest_score")
+            delta = st.get("score_delta") or 0
+            desc = st.get("latest_descendants")
+            delta_str = f" (Δ+{delta})" if delta > 0 else (f" (Δ{delta})" if delta < 0 else "")
+            score_str = f"Score: {latest_score}{delta_str}" if latest_score is not None else "Score: n/a"
+            desc_str = f", Comments: {desc}" if desc is not None else ""
+            feed_str = f" [{feed_id}]" if feed_id else ""
+            lines.append(f"- [ID: {eid}]{feed_str} {title} ({score_str}{desc_str})")
+            if st.get("url"):
+                lines.append(f"  URL: {st.get('url')}")
+        lines.append("")
+    else:
+        lines.append("No matching historical snapshots recorded for this topic window.")
+        lines.append("")
+
+    if takeaways:
+        lines.append("## Archived Takeaways")
+        for tk in takeaways:
+            lines.append(f"- [{tk.get('external_id')}] {tk.get('title') or 'Untitled'}")
+            if tk.get("key_takeaway"):
+                lines.append(f"  Takeaway: {tk.get('key_takeaway')}")
+            if tk.get("community_consensus"):
+                lines.append(f"  Consensus: {tk.get('community_consensus')}")
+
+    return _apply_max_chars("\n".join(lines).strip(), max_chars)
 
 
 def format_deep_dive_for_agent(
@@ -389,18 +515,19 @@ HN_AGENT_TOOL_DEFINITIONS = [
         "function": {
             "name": "hn_search",
             "description": (
-                "Search and browse Hacker News headlines. Feed IDs: 'hn_top' (front page), "
-                "'hn_new' (newest), 'hn_best' (best), 'hn_ask' (Ask HN), or 'hn_show' (Show HN). "
-                "Optional query filters titles; optional focus re-ranks by topic relevance."
+                "Search and browse tech feeds across Hacker News ('hn_top', 'hn_new', 'hn_best', "
+                "'hn_ask', 'hn_show'), Lobste.rs ('lobsters_hot', 'lobsters_new'), and GitHub "
+                "Trending ('github_trending'). Optional query filters titles; optional focus "
+                "re-ranks by topic relevance."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "feed_id": {
                         "type": "string",
-                        "enum": list(SUPPORTED_FEED_IDS),
+                        "enum": list(ALL_SUPPORTED_FEED_IDS),
                         "default": "hn_top",
-                        "description": "Feed category to retrieve.",
+                        "description": "Feed category to retrieve across supported sensors.",
                     },
                     "page": {
                         "type": "integer",
@@ -455,16 +582,17 @@ HN_AGENT_TOOL_DEFINITIONS = [
         "function": {
             "name": "hn_radar",
             "description": (
-                "Zero-LLM-token Six Eyes Signal Radar: scans multiple HN feeds concurrently, "
-                "deduplicates stories, computes velocity/debate signals, filters by badges, "
-                "optionally re-ranks by BM25 focus, and clusters related stories."
+                "Zero-LLM-token Six Eyes Signal Radar: scans multiple feeds concurrently "
+                "(HN + optional Lobste.rs & GitHub Trending), deduplicates per sensor, computes "
+                "velocity/debate/corroborated signals, optionally applies learned adaptive focus, "
+                "filters by badges, and clusters cross-source corroborated stories."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "feeds": {
                         "type": "array",
-                        "items": {"type": "string", "enum": list(SUPPORTED_FEED_IDS)},
+                        "items": {"type": "string", "enum": list(ALL_SUPPORTED_FEED_IDS)},
                         "description": "Feeds to scan concurrently (default: ['hn_top', 'hn_best']).",
                     },
                     "top_n": {
@@ -480,11 +608,52 @@ HN_AGENT_TOOL_DEFINITIONS = [
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["breakout", "rising", "high-debate", "slow-burn"],
+                            "enum": ["breakout", "rising", "high-debate", "slow-burn", "corroborated"],
                         },
-                        "description": "Optional signal badge filter (e.g. ['breakout', 'high-debate']).",
+                        "description": "Optional signal badge filter (e.g. ['breakout', 'corroborated']).",
+                    },
+                    "personalized": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Apply learned adaptive focus profile from local summary history.",
+                    },
+                    "include_sensors": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Automatically include lobsters_hot and github_trending alongside HN feeds for cross-source corroboration.",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hn_topic_pulse",
+            "description": (
+                "Temporal memory pulse for a technical topic: tracks historical sightings, "
+                "score trajectories, debate ratio, trend direction (rising/steady/cooling), "
+                "and archived takeaways over a lookback window."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic query (supports AND terms or comma-separated OR clauses, e.g. 'rust async, tokio').",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "Lookback window in days (default: 30).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 50,
+                        "description": "Maximum number of timeline stories to return.",
+                    },
+                },
+                "required": ["topic"],
             },
         },
     },
@@ -579,7 +748,7 @@ HN_AGENT_TOOL_DEFINITIONS = [
                 "properties": {
                     "feed_id": {
                         "type": "string",
-                        "enum": list(SUPPORTED_FEED_IDS),
+                        "enum": list(ALL_SUPPORTED_FEED_IDS),
                         "default": "hn_top",
                         "description": "Feed to synthesize.",
                     },
@@ -699,7 +868,7 @@ class GojoAgentToolkit:
         self,
         provider: Literal["openai", "anthropic", "gemini"] = "openai",
     ) -> list[dict[str, Any]]:
-        """Export all 9 Gojo tool definitions formatted for OpenAI, Anthropic, or Gemini."""
+        """Export all 10 Gojo tool definitions formatted for OpenAI, Anthropic, or Gemini."""
         if provider == "openai":
             return copy.deepcopy(HN_AGENT_TOOL_DEFINITIONS)
         if provider == "anthropic":
@@ -772,6 +941,9 @@ class GojoAgentToolkit:
             if name == "hn_radar":
                 res = await tool_radar_hn(svc, **kwargs)
                 return format_radar_for_agent(res, max_chars=max_chars) if as_text else res
+            if name == "hn_topic_pulse":
+                res = await tool_topic_pulse(svc, **kwargs)
+                return format_topic_pulse_for_agent(res, max_chars=max_chars) if as_text else res
             if name == "hn_summarize":
                 res = await tool_summarize_hn(svc, **kwargs)
                 return format_summary_for_agent(res, max_chars=max_chars) if as_text else res

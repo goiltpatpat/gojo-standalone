@@ -30,21 +30,27 @@ from .prompts import (
 )
 from .providers.algolia import HackerNewsAlgoliaProvider
 from .providers.base import FeedSource
-from .providers.hn import SUPPORTED_FEED_IDS, HackerNewsFeedSource
+from .providers.github_trending import GitHubTrendingFeedSource
+from .providers.hn import HackerNewsFeedSource
 from .providers.llm import (
     AutoLLMProvider,
     LLMProvider,
     OpenAIProvider,
 )
+from .providers.lobsters import LobstersFeedSource
 from .signals import (
+    annotate_cross_source_clusters,
+    build_adaptive_focus_profile,
     cluster_related_stories,
     enrich_items_with_signals,
+    profile_to_focus_query,
     rank_items_by_focus,
 )
 from .ssrf import is_public_http_url_for_fetch, validate_public_url_with_dns
 from .storage.base import StorageBackend
 from .storage.sqlite import SQLiteStorage
 from .types import (
+    ALL_SUPPORTED_FEED_IDS,
     DigestArtifact,
     DigestCompletion,
     DigestFeedItem,
@@ -156,6 +162,8 @@ class GojoHNService:
         self,
         *,
         feed_source: FeedSource | None = None,
+        lobsters_source: LobstersFeedSource | None = None,
+        github_source: GitHubTrendingFeedSource | None = None,
         algolia_provider: HackerNewsAlgoliaProvider | None = None,
         storage: StorageBackend | None = None,
         llm_provider: LLMProvider | None = None,
@@ -165,6 +173,8 @@ class GojoHNService:
         custom_summarizer: Callable[..., Coroutine[Any, Any, str]] | None = None,
     ) -> None:
         self.source = feed_source or HackerNewsFeedSource()
+        self.lobsters_source = lobsters_source or LobstersFeedSource()
+        self.github_source = github_source or GitHubTrendingFeedSource()
         self.algolia = algolia_provider or HackerNewsAlgoliaProvider()
         self.storage = storage or SQLiteStorage(
             os.getenv("GOJO_HN_DB_PATH", "gojo_hn.db")
@@ -213,7 +223,13 @@ class GojoHNService:
             await self._article_http.aclose()
             self._article_http = None
 
-        for resource in (self.source, self.algolia, self.llm_provider):
+        for resource in (
+            self.source,
+            self.lobsters_source,
+            self.github_source,
+            self.algolia,
+            self.llm_provider,
+        ):
             close_fn = getattr(resource, "close", None)
             if callable(close_fn):
                 res = close_fn()
@@ -250,11 +266,14 @@ class GojoHNService:
         _record_snapshots: bool = True,
     ) -> DigestFeedResponse:
         """
-        List stories for feed_id ('hn_top', 'hn_new', 'hn_best', 'hn_ask', 'hn_show').
+        List stories for any supported multi-sensor feed_id:
+        - Hacker News: 'hn_top', 'hn_new', 'hn_best', 'hn_ask', 'hn_show'
+        - Lobste.rs: 'lobsters_hot', 'lobsters_new'
+        - GitHub Trending: 'github_trending'
         Returns cached list if present and unexpired unless force_refresh is True.
         """
-        if feed_id not in SUPPORTED_FEED_IDS:
-            allowed = ", ".join(f"'{fid}'" for fid in SUPPORTED_FEED_IDS)
+        if feed_id not in ALL_SUPPORTED_FEED_IDS:
+            allowed = ", ".join(f"'{fid}'" for fid in ALL_SUPPORTED_FEED_IDS)
             raise ValueError(f"Invalid feed_id '{feed_id}'. Must be one of: {allowed}.")
 
         page = max(1, page)
@@ -281,10 +300,23 @@ class GojoHNService:
                     list_cache_ttl_seconds=LIST_CACHE_TTL_S,
                 )
 
-        variant = feed_id.removeprefix("hn_")
-        raw_items, has_more = await self.source.list_page(
-            feed_variant=variant, page=page, page_size=page_size
-        )
+        if feed_id.startswith("hn_"):
+            variant = feed_id.removeprefix("hn_")
+            raw_items, has_more = await self.source.list_page(
+                feed_variant=variant, page=page, page_size=page_size
+            )
+        elif feed_id.startswith("lobsters_"):
+            variant = feed_id.removeprefix("lobsters_")
+            raw_items, has_more = await self.lobsters_source.list_page(
+                feed_variant=variant, page=page, page_size=page_size
+            )
+        elif feed_id == "github_trending":
+            raw_items, has_more = await self.github_source.list_page(
+                feed_variant="github_trending", page=page, page_size=page_size
+            )
+        else:
+            allowed = ", ".join(f"'{fid}'" for fid in ALL_SUPPORTED_FEED_IDS)
+            raise ValueError(f"Invalid feed_id '{feed_id}'. Must be one of: {allowed}.")
         items = enrich_items_with_signals(raw_items)
 
         if _record_snapshots and items:
@@ -857,6 +889,38 @@ class GojoHNService:
             max_tokens=4096,
         )
 
+    async def get_adaptive_focus_profile(
+        self,
+        *,
+        limit: int = 40,
+        top_terms: int = 20,
+    ) -> dict[str, Any]:
+        """
+        Build a zero-LLM-token adaptive interest profile from recent local summary history.
+        Returns weighted terms, a BM25-compatible focus_query, and the corpus_size.
+        """
+        corpus = await self.storage.get_recent_interest_corpus(limit=limit)
+        profile = build_adaptive_focus_profile(corpus, top_terms=top_terms)
+        focus_query = profile_to_focus_query(profile)
+        return {
+            "terms": [{"term": term, "weight": weight} for term, weight in profile],
+            "focus_query": focus_query,
+            "corpus_size": len(corpus),
+        }
+
+    async def topic_pulse(
+        self,
+        *,
+        topic: str,
+        days: int = 30,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """
+        Build a temporal memory pulse/timeline for a topic from historical snapshots
+        and archived summaries.
+        """
+        return await self.storage.get_topic_timeline(topic, days=days, limit=limit)
+
     async def radar(
         self,
         *,
@@ -865,14 +929,22 @@ class GojoHNService:
         top_n: int = 10,
         focus: str | None = None,
         badges: list[str] | None = None,
+        personalized: bool = False,
+        include_sensors: bool = False,
     ) -> dict[str, Any]:
         """
         Zero-LLM-token Six Eyes Signal Radar:
-        Concurrently scans one or more HN feeds, deduplicates stories, ensures signals are
-        computed, optionally filters by signal badges and re-ranks by BM25 focus, clusters
-        related stories, and returns a structured signal radar payload.
+        Concurrently scans one or more multi-sensor feeds (HN, Lobste.rs, GitHub Trending),
+        deduplicates per (feed_provider, external_id), enriches signals, detects cross-source
+        corroboration, optionally applies adaptive focus profiling and badge filtering, and
+        returns a structured signal radar payload.
         """
-        raw_feeds = feeds if feeds else ["hn_top", "hn_best"]
+        raw_feeds = list(feeds) if feeds else ["hn_top", "hn_best"]
+        if include_sensors:
+            for sensor_feed in ("lobsters_hot", "github_trending"):
+                if sensor_feed not in raw_feeds:
+                    raw_feeds.append(sensor_feed)
+
         target_feeds: list[str] = []
         seen_feeds: set[str] = set()
         for f in raw_feeds:
@@ -886,21 +958,26 @@ class GojoHNService:
         limit_per_feed = max(1, int(limit_per_feed))
         top_n = max(1, int(top_n))
 
-        feed_responses = await asyncio.gather(
+        feed_results = await asyncio.gather(
             *(
                 self.list_feed(feed_id=fid, page=1, page_size=limit_per_feed)
                 for fid in target_feeds
-            )
+            ),
+            return_exceptions=True,
         )
 
+        sensor_errors: list[dict[str, str]] = []
         deduped: list[DigestFeedItem] = []
-        seen_ids: set[str] = set()
-        for resp in feed_responses:
+        seen_keys: set[tuple[str, str]] = set()
+        for fid, resp in zip(target_feeds, feed_results):
+            if isinstance(resp, BaseException):
+                sensor_errors.append({"feed_id": fid, "error": str(resp)})
+                continue
             for item in resp.items:
-                ext_id = str(item.external_id)
-                if ext_id in seen_ids:
+                key = (str(item.feed_provider or "hn"), str(item.external_id))
+                if key in seen_keys:
                     continue
-                seen_ids.add(ext_id)
+                seen_keys.add(key)
                 deduped.append(item)
 
         total_scanned = len(deduped)
@@ -913,6 +990,30 @@ class GojoHNService:
             else:
                 items.append(item)
 
+        # Pre-annotate cross-source corroboration so 'corroborated' badge is visible
+        # for badge filtering and ranking.
+        if items:
+            pre_annotated = annotate_cross_source_clusters(cluster_related_stories(items))
+            corroborated_keys: set[tuple[str, str]] = set()
+            for ann in pre_annotated:
+                if ann["is_corroborated"]:
+                    for ci in ann["items"]:
+                        corroborated_keys.add(
+                            (str(ci.feed_provider or "hn"), str(ci.external_id))
+                        )
+            if corroborated_keys:
+                tagged_items: list[DigestFeedItem] = []
+                for it in items:
+                    key = (str(it.feed_provider or "hn"), str(it.external_id))
+                    if key in corroborated_keys:
+                        b = list(it.signal_badges or [])
+                        if "corroborated" not in b:
+                            b.append("corroborated")
+                        tagged_items.append(it.model_copy(update={"signal_badges": b}))
+                    else:
+                        tagged_items.append(it)
+                items = tagged_items
+
         badges_filter = [
             b.strip().lower() for b in (badges or []) if isinstance(b, str) and b.strip()
         ]
@@ -924,13 +1025,33 @@ class GojoHNService:
                 if any(b.lower() in badge_set for b in (it.signal_badges or []))
             ]
 
-        focus_clean = focus.strip() if isinstance(focus, str) and focus.strip() else None
-        if focus_clean and items:
-            ranked = rank_items_by_focus(items, focus_clean)
+        explicit_focus = focus.strip() if isinstance(focus, str) and focus.strip() else None
+        personalized_applied = False
+        learned_focus_terms: list[str] = []
+        effective_focus = explicit_focus
+
+        if personalized:
+            profile_data = await self.get_adaptive_focus_profile()
+            learned_query = str(profile_data.get("focus_query") or "").strip()
+            learned_focus_terms = [
+                str(entry["term"])
+                for entry in (profile_data.get("terms") or [])
+                if isinstance(entry, dict) and entry.get("term")
+            ]
+            if learned_query:
+                personalized_applied = True
+                if explicit_focus:
+                    effective_focus = f"{explicit_focus} {learned_query}"
+                else:
+                    effective_focus = learned_query
+
+        if effective_focus and items:
+            ranked = rank_items_by_focus(items, effective_focus)
             items = [it for it, _score in ranked]
         elif items:
             items.sort(
                 key=lambda it: (
+                    1 if "corroborated" in (it.signal_badges or []) else 0,
                     1 if (it.signal_badges or []) else 0,
                     float(it.velocity or 0.0),
                     int(it.score or 0),
@@ -940,24 +1061,45 @@ class GojoHNService:
 
         top_items = items[:top_n]
         raw_clusters = cluster_related_stories(top_items)
-        clusters = [
-            {
-                "cluster_id": idx,
-                "size": len(cluster),
-                "lead_external_id": cluster[0].external_id,
-                "lead_title": cluster[0].title,
-                "items": [it.model_dump(mode="json") for it in cluster],
-            }
-            for idx, cluster in enumerate(raw_clusters, start=1)
+        annotated_clusters = annotate_cross_source_clusters(raw_clusters)
+
+        updated_by_key: dict[tuple[str, str], DigestFeedItem] = {}
+        clusters: list[dict[str, Any]] = []
+        for idx, ann in enumerate(annotated_clusters, start=1):
+            c_items: list[DigestFeedItem] = ann["items"]
+            for ci in c_items:
+                updated_by_key[(str(ci.feed_provider or "hn"), str(ci.external_id))] = ci
+            clusters.append(
+                {
+                    "cluster_id": idx,
+                    "size": len(c_items),
+                    "lead_external_id": c_items[0].external_id,
+                    "lead_title": c_items[0].title,
+                    "sources": ann["sources"],
+                    "corroboration_count": ann["corroboration_count"],
+                    "is_corroborated": ann["is_corroborated"],
+                    "max_velocity": ann["max_velocity"],
+                    "items": [it.model_dump(mode="json") for it in c_items],
+                }
+            )
+
+        corroborated_clusters = [c for c in clusters if c["is_corroborated"]]
+        final_top_items = [
+            updated_by_key.get((str(it.feed_provider or "hn"), str(it.external_id)), it)
+            for it in top_items
         ]
 
         return {
             "feeds_scanned": target_feeds,
             "total_scanned": total_scanned,
             "clusters": clusters,
-            "top_items": [it.model_dump(mode="json") for it in top_items],
-            "focus_applied": focus_clean,
+            "corroborated_clusters": corroborated_clusters,
+            "top_items": [it.model_dump(mode="json") for it in final_top_items],
+            "focus_applied": effective_focus,
             "badges_filter": badges_filter,
+            "personalized_applied": personalized_applied,
+            "learned_focus_terms": learned_focus_terms,
+            "sensor_errors": sensor_errors,
         }
 
     async def deep_dive(
