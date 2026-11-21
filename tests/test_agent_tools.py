@@ -5,15 +5,21 @@ import pytest
 
 from gojo.agent_tools import (
     HN_AGENT_TOOL_DEFINITIONS,
+    GojoAgentToolkit,
     filter_items_by_query,
     format_archive_search_for_agent,
+    format_deep_dive_for_agent,
+    format_radar_for_agent,
     format_search_for_agent,
     format_summary_for_agent,
     tool_briefing_hn,
+    tool_deep_dive_hn,
     tool_get_artifact,
     tool_get_hn_story,
+    tool_radar_hn,
     tool_search_archive,
     tool_search_hn,
+    tool_search_hn_full,
     tool_summarize_hn,
 )
 from gojo.cli import build_parser
@@ -41,20 +47,27 @@ def test_filter_items_by_query() -> None:
 
 
 def test_agent_tool_definitions_valid() -> None:
-    assert len(HN_AGENT_TOOL_DEFINITIONS) >= 6
+    assert len(HN_AGENT_TOOL_DEFINITIONS) == 9
     by_name = {t["function"]["name"]: t["function"] for t in HN_AGENT_TOOL_DEFINITIONS}
-    assert "hn_search" in by_name
-    assert "hn_summarize" in by_name
-    assert "hn_briefing" in by_name
-    assert "hn_get_story" in by_name
-    assert "hn_search_archive" in by_name
-    assert "hn_get_artifact" in by_name
+    assert set(by_name.keys()) == {
+        "hn_search",
+        "hn_search_full",
+        "hn_radar",
+        "hn_summarize",
+        "hn_deep_dive",
+        "hn_briefing",
+        "hn_get_story",
+        "hn_search_archive",
+        "hn_get_artifact",
+    }
 
     # Verify reconciled defaults and 5-feed enum
     search_feeds = by_name["hn_search"]["parameters"]["properties"]["feed_id"]["enum"]
     assert set(search_feeds) == {"hn_top", "hn_new", "hn_best", "hn_ask", "hn_show"}
     assert "focus" in by_name["hn_search"]["parameters"]["properties"]
     assert by_name["hn_briefing"]["parameters"]["properties"]["locale"]["default"] == "th"
+    assert by_name["hn_search_full"]["parameters"]["required"] == ["query"]
+    assert by_name["hn_deep_dive"]["parameters"]["required"] == ["topic"]
 
 
 @pytest.mark.asyncio
@@ -286,3 +299,345 @@ async def test_mcp_server_tool_parity_and_shared_lazy_service() -> None:
 
     assert factory_calls == 1
     mock_svc.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_tool_executors_and_formatters() -> None:
+    mock_svc = AsyncMock()
+    mock_svc.search_hn_archive.return_value = [
+        DigestFeedItem(
+            feed_provider="hn",
+            external_id="501",
+            title="PostgreSQL 18 Async I/O",
+            score=420,
+            descendants=180,
+            url="https://example.com/pg18",
+            signal_badges=["breakout"],
+        )
+    ]
+    full_out = await tool_search_hn_full(mock_svc, query="PostgreSQL", limit=5, sort_by="date")
+    assert full_out["query"] == "PostgreSQL"
+    assert full_out["sort_by"] == "date"
+    assert full_out["total_returned"] == 1
+    fmt_full = format_search_for_agent(full_out)
+    assert "HN Archive Query: PostgreSQL" in fmt_full
+    assert "PostgreSQL 18 Async I/O" in fmt_full
+
+    mock_svc.radar.return_value = {
+        "feeds_scanned": ["hn_top", "hn_best"],
+        "total_scanned": 30,
+        "focus_applied": "postgres",
+        "badges_filter": ["breakout"],
+        "top_items": [
+            {
+                "external_id": "501",
+                "title": "PostgreSQL 18 Async I/O",
+                "score": 420,
+                "descendants": 180,
+                "velocity": 42.5,
+                "signal_badges": ["breakout"],
+                "url": "https://example.com/pg18",
+            }
+        ],
+        "clusters": [
+            {
+                "cluster_id": 1,
+                "size": 1,
+                "lead_external_id": "501",
+                "lead_title": "PostgreSQL 18 Async I/O",
+                "items": [
+                    {
+                        "external_id": "501",
+                        "title": "PostgreSQL 18 Async I/O",
+                        "score": 420,
+                        "descendants": 180,
+                        "velocity": 42.5,
+                        "signal_badges": ["breakout"],
+                        "url": "https://example.com/pg18",
+                    }
+                ],
+            }
+        ],
+    }
+    radar_out = await tool_radar_hn(
+        mock_svc, feeds=["hn_top", "hn_best"], top_n=5, focus="postgres", badges=["breakout"]
+    )
+    assert radar_out["total_scanned"] == 30
+    fmt_radar = format_radar_for_agent(radar_out)
+    assert "Six Eyes Radar" in fmt_radar
+    assert "PostgreSQL 18 Async I/O" in fmt_radar
+    assert len(format_radar_for_agent(radar_out, max_chars=70)) <= 70
+
+    mock_svc.deep_dive.return_value = {
+        "topic": "PostgreSQL",
+        "stories_analyzed": 1,
+        "cached_hits": 1,
+        "summaries": [
+            {
+                "artifact": {
+                    "id": "art-1",
+                    "external_id": "501",
+                    "title": "PostgreSQL 18 Async I/O",
+                    "source_url": "https://example.com/pg18",
+                    "summary_markdown": "## Summary\nAsync I/O cuts read latency.",
+                },
+                "completion": {"status": "cached", "cache_layer": "sqlite"},
+            }
+        ],
+        "local_archive_matches": [],
+        "errors": [],
+    }
+    dd_out = await tool_deep_dive_hn(mock_svc, topic="PostgreSQL", max_stories=2)
+    assert dd_out["stories_analyzed"] == 1
+    fmt_dd = format_deep_dive_for_agent(dd_out)
+    assert "# Deep Dive Dossier: PostgreSQL" in fmt_dd
+    assert "Async I/O cuts read latency." in fmt_dd
+    assert len(format_deep_dive_for_agent(dd_out, max_chars=80)) <= 80
+
+
+@pytest.mark.asyncio
+async def test_gojo_agent_toolkit_schemas_and_lifecycle() -> None:
+    ext_svc = AsyncMock()
+    async with GojoAgentToolkit(service=ext_svc) as kit:
+        openai_schemas = kit.schemas("openai")
+        anthropic_schemas = kit.schemas("anthropic")
+        gemini_schemas = kit.schemas("gemini")
+
+        assert len(openai_schemas) == 9
+        assert len(anthropic_schemas) == 9
+        assert len(gemini_schemas) == 9
+
+        assert openai_schemas[0]["type"] == "function"
+        assert "function" in openai_schemas[0]
+
+        assert "input_schema" in anthropic_schemas[0]
+        assert "name" in anthropic_schemas[0]
+        assert "description" in anthropic_schemas[0]
+
+        assert "parameters" in gemini_schemas[0]
+        assert "name" in gemini_schemas[0]
+        assert "description" in gemini_schemas[0]
+
+        with pytest.raises(ValueError, match="Unsupported schema provider"):
+            kit.schemas("unknown")  # type: ignore[arg-type]
+
+    # Externally supplied service must NOT be closed by toolkit
+    ext_svc.close.assert_not_awaited()
+
+    # Auto-created service MUST be closed on exit
+    owned_svc = AsyncMock()
+    with patch("gojo.agent_tools.GojoHNService", return_value=owned_svc):
+        async with GojoAgentToolkit() as owned_kit:
+            assert owned_kit.service is owned_svc
+    owned_svc.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gojo_agent_toolkit_dispatch_success_json_args_max_chars_and_errors() -> None:
+    import json
+
+    mock_svc = AsyncMock()
+    mock_svc.radar.return_value = {
+        "feeds_scanned": ["hn_top"],
+        "total_scanned": 5,
+        "focus_applied": "rust",
+        "badges_filter": [],
+        "top_items": [
+            {
+                "external_id": "1",
+                "title": "Rust Compiler Speedups",
+                "score": 300,
+                "descendants": 90,
+                "velocity": 25.0,
+                "signal_badges": ["breakout"],
+            }
+        ],
+        "clusters": [
+            {
+                "cluster_id": 1,
+                "size": 1,
+                "lead_external_id": "1",
+                "lead_title": "Rust Compiler Speedups",
+                "items": [
+                    {
+                        "external_id": "1",
+                        "title": "Rust Compiler Speedups",
+                        "score": 300,
+                        "descendants": 90,
+                        "velocity": 25.0,
+                        "signal_badges": ["breakout"],
+                    }
+                ],
+            }
+        ],
+    }
+    mock_svc.source.get_item.return_value = None
+    mock_svc.search_hn_archive.side_effect = RuntimeError("Algolia timeout")
+
+    async with GojoAgentToolkit(service=mock_svc) as kit:
+        # JSON string arguments + as_text=True + max_chars
+        txt = await kit.dispatch(
+            "hn_radar",
+            json.dumps({"feeds": ["hn_top"], "focus": "rust", "top_n": 3}),
+            max_chars=75,
+            as_text=True,
+        )
+        assert isinstance(txt, str)
+        assert len(txt) <= 75
+        assert txt.endswith("... [truncated]")
+
+        # Dict arguments + as_text=False
+        raw = await kit.dispatch("hn_radar", {"feeds": ["hn_top"]}, as_text=False)
+        assert isinstance(raw, dict)
+        assert raw["total_scanned"] == 5
+
+        # Invalid JSON string -> error envelope (no crash)
+        bad_json = await kit.dispatch("hn_radar", "{not valid json", as_text=False)
+        assert isinstance(bad_json, dict)
+        assert bad_json["ok"] is False
+        assert "Invalid JSON" in bad_json["error"]
+
+        # Unknown tool -> error envelope (no crash)
+        unknown = await kit.dispatch("hn_nonexistent", {}, as_text=False)
+        assert isinstance(unknown, dict)
+        assert unknown["ok"] is False
+        assert "Unknown tool" in unknown["error"]
+
+        # Runtime exception inside tool -> caught into error envelope
+        err_text = await kit.dispatch("hn_search_full", {"query": "rust"}, as_text=True)
+        assert isinstance(err_text, str)
+        assert "Algolia timeout" in err_text
+
+        # Missing story -> structured error envelope
+        missing = await kit.dispatch("hn_get_story", {"external_id": "999999"}, as_text=False)
+        assert isinstance(missing, dict)
+        assert missing["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_prompts_resources_and_9_tools() -> None:
+    import json
+    import gojo.mcp_server as mcp_mod
+
+    class _FullFakeFastMCP:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.tools: dict[str, object] = {}
+            self.prompts: dict[str, object] = {}
+            self.resources: dict[str, object] = {}
+
+        def tool(self):
+            def decorator(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+        def prompt(self):
+            def decorator(fn):
+                self.prompts[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+        def resource(self, uri: str):
+            def decorator(fn):
+                self.resources[uri] = fn
+                return fn
+
+            return decorator
+
+    art = DigestArtifact(
+        fingerprint="res" * 21 + "r",
+        feed_provider="hn",
+        external_id="77",
+        title="Recent Cached Story",
+        locale="en",
+        prompt_version="v5",
+        summary_markdown="## Summary\nCached details.",
+    )
+    mock_svc = AsyncMock()
+    mock_svc.list_recent_artifacts.return_value = [art]
+    mock_svc.radar.return_value = {
+        "feeds_scanned": ["hn_top"],
+        "total_scanned": 1,
+        "focus_applied": None,
+        "badges_filter": [],
+        "top_items": [],
+        "clusters": [],
+    }
+
+    with patch.object(mcp_mod, "_import_fastmcp", return_value=_FullFakeFastMCP):
+        server = mcp_mod.create_mcp_server(service_factory=lambda: mock_svc)
+
+    # All 9 tools registered
+    assert len(server.tools) == 9
+    assert {"hn_search_full", "hn_radar", "hn_deep_dive"}.issubset(server.tools.keys())
+
+    # Prompts registered and return concise anti-slop text
+    assert set(server.prompts.keys()) == {"morning_tech_radar", "topic_deep_dive"}
+    p1 = server.prompts["morning_tech_radar"](focus="rust")
+    assert "hn_radar" in p1 and "rust" in p1
+    p2 = server.prompts["topic_deep_dive"](topic="sqlite")
+    assert "hn_deep_dive" in p2 and "sqlite" in p2
+
+    # Resources registered
+    assert set(server.resources.keys()) == {"gojo://providers", "gojo://archive/recent"}
+    recent_json = await server.resources["gojo://archive/recent"]()
+    recent_data = json.loads(recent_json)
+    assert len(recent_data) == 1
+    assert recent_data[0]["title"] == "Recent Cached Story"
+
+    with (
+        patch.object(mcp_mod.OllamaProvider, "is_available", new_callable=AsyncMock, return_value=False),
+        patch.object(mcp_mod.OllamaProvider, "close", new_callable=AsyncMock),
+        patch.object(mcp_mod.AutoLLMProvider, "resolve_provider", new_callable=AsyncMock, side_effect=RuntimeError("no key")),
+        patch.object(mcp_mod.AutoLLMProvider, "close", new_callable=AsyncMock),
+    ):
+        prov_json = await server.resources["gojo://providers"]()
+        prov_data = json.loads(prov_json)
+        assert "openai_configured" in prov_data
+        assert "ollama_available" in prov_data
+
+
+def test_cli_parser_supercommands_and_exports() -> None:
+    import gojo
+
+    for sym in (
+        "GojoAgentToolkit",
+        "tool_search_hn_full",
+        "tool_radar_hn",
+        "tool_deep_dive_hn",
+        "format_radar_for_agent",
+        "format_deep_dive_for_agent",
+    ):
+        assert hasattr(gojo, sym)
+
+    parser = build_parser()
+
+    args_radar = parser.parse_args(
+        ["radar", "--feeds", "top", "best", "--top", "7", "--focus", "ai", "--badges", "breakout", "--json"]
+    )
+    assert args_radar.command == "radar"
+    assert args_radar.feeds == ["top", "best"]
+    assert args_radar.top == 7
+    assert args_radar.focus == "ai"
+    assert args_radar.badges == ["breakout"]
+    assert args_radar.json is True
+
+    args_hn_arch = parser.parse_args(["hn-archive", "ebpf", "--limit", "12", "--sort", "date", "--json"])
+    assert args_hn_arch.command == "hn-archive"
+    assert args_hn_arch.query == "ebpf"
+    assert args_hn_arch.limit == 12
+    assert args_hn_arch.sort == "date"
+    assert args_hn_arch.json is True
+
+    args_dd = parser.parse_args(
+        ["deep-dive", "WebAssembly", "--max-stories", "4", "--type", "bullet", "--locale", "th", "--json"]
+    )
+    assert args_dd.command == "deep-dive"
+    assert args_dd.topic == "WebAssembly"
+    assert args_dd.max_stories == 4
+    assert args_dd.type == "bullet"
+    assert args_dd.locale == "th"
+    assert args_dd.json is True

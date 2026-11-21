@@ -3,9 +3,12 @@ Command line interface for Gojo Hacker News workflow.
 Usage:
     python -m gojo.cli list [--feed top|new|best|ask|show] [--page 1] [--focus "..."] [--force]
     python -m gojo.cli search <query> [--feed top|new|best|ask|show] [--focus "..."]
+    python -m gojo.cli radar [--feeds top best] [--top 10] [--focus "..."] [--badges breakout] [--json]
+    python -m gojo.cli hn-archive <query> [--limit 15] [--sort relevance|date] [--json]
     python -m gojo.cli archive-search <query> [--limit 10] [--json]
     python -m gojo.cli get <story_id>
     python -m gojo.cli summarize <story_id> [--type quick|technical|bullet|thai_concise] [--no-comments]
+    python -m gojo.cli deep-dive <topic> [--max-stories 3] [--type technical] [--locale en] [--json]
     python -m gojo.cli briefing [--feed top|new|best|ask|show] [--limit 10] [--locale th|en] [--focus "..."] [--since-last] [--json]
     python -m gojo.cli providers [--json]
     python -m gojo.cli mcp
@@ -19,7 +22,11 @@ import json
 import os
 import sys
 
-from .agent_tools import filter_items_by_query
+from .agent_tools import (
+    filter_items_by_query,
+    format_deep_dive_for_agent,
+    format_radar_for_agent,
+)
 from .mcp_server import run_mcp_server
 from .providers.hn import SUPPORTED_FEED_VARIANTS
 from .providers.llm import AutoLLMProvider, OllamaProvider
@@ -36,7 +43,24 @@ _FEED_MAP: dict[str, str] = {
 
 
 def _resolve_feed_id(feed_arg: str) -> str:
-    return _FEED_MAP.get(feed_arg, "hn_top")
+    if feed_arg in _FEED_MAP:
+        return _FEED_MAP[feed_arg]
+    if feed_arg.startswith("hn_") and feed_arg.removeprefix("hn_") in _FEED_MAP:
+        return feed_arg
+    return "hn_top"
+
+
+def _parse_multi_arg(values: list[str] | str | None) -> list[str] | None:
+    if not values:
+        return None
+    raw_list = [values] if isinstance(values, str) else list(values)
+    out: list[str] = []
+    for entry in raw_list:
+        for part in str(entry).split(","):
+            cleaned = part.strip()
+            if cleaned:
+                out.append(cleaned)
+    return out or None
 
 
 def _print_items(items, json_output: bool = False) -> None:
@@ -66,8 +90,7 @@ def _print_items(items, json_output: bool = False) -> None:
 
 
 async def _run_cli(args: argparse.Namespace) -> None:
-    svc = GojoHNService()
-    try:
+    async with GojoHNService() as svc:
         if args.command == "list":
             feed_id = _resolve_feed_id(args.feed)
             res = await svc.list_feed(
@@ -257,13 +280,67 @@ async def _run_cli(args: argparse.Namespace) -> None:
                 else:
                     print(f"\nActive Auto-Selected Provider: \033[1;31mNone ({active_error})\033[0m")
 
+        elif args.command == "radar":
+            raw_feeds = _parse_multi_arg(getattr(args, "feeds", None))
+            resolved_feeds = (
+                [_resolve_feed_id(f) for f in raw_feeds] if raw_feeds else None
+            )
+            badges = _parse_multi_arg(getattr(args, "badges", None))
+            res = await svc.radar(
+                feeds=resolved_feeds,
+                top_n=args.top,
+                focus=getattr(args, "focus", None),
+                badges=badges,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(format_radar_for_agent(res))
+
+        elif args.command == "hn-archive":
+            items = await svc.search_hn_archive(
+                query=args.query,
+                limit=args.limit,
+                sort_by=args.sort,
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        [it.model_dump(mode="json") for it in items],
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(
+                    f"--- HN Full Archive Search for '{args.query}' "
+                    f"(sort: {args.sort}, {len(items)} hits) ---"
+                )
+                _print_items(items)
+
+        elif args.command == "deep-dive":
+            print(
+                f"Running Deep Dive for '{args.topic}' "
+                f"(max {args.max_stories} stories, type: {args.type}, locale: {args.locale})...\n",
+                file=sys.stderr,
+            )
+            res = await svc.deep_dive(
+                topic=args.topic,
+                max_stories=args.max_stories,
+                summary_type=args.type,
+                locale=args.locale,
+                include_comments=getattr(args, "comments", True),
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(format_deep_dive_for_agent(res))
+
         else:
             print(
-                "Please specify a command: list, search, archive-search, get, summarize, "
-                "briefing, providers, or mcp. Run with --help for details."
+                "Please specify a command: list, search, radar, hn-archive, archive-search, "
+                "get, summarize, deep-dive, briefing, providers, or mcp. Run with --help for details."
             )
-    finally:
-        await svc.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -341,6 +418,71 @@ def build_parser() -> argparse.ArgumentParser:
     # providers
     p_prov = subparsers.add_parser("providers", help="Inspect available LLM providers and models")
     p_prov.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    # radar
+    p_radar = subparsers.add_parser(
+        "radar",
+        help="Zero-LLM-token Six Eyes Signal Radar across multiple HN feeds",
+    )
+    p_radar.add_argument(
+        "--feeds",
+        nargs="+",
+        default=None,
+        help="Feeds to scan (e.g. top best ask or comma-separated top,best)",
+    )
+    p_radar.add_argument("--top", type=int, default=10, help="Maximum top stories to return")
+    p_radar.add_argument("--focus", default=None, help="BM25 focus query to re-rank stories")
+    p_radar.add_argument(
+        "--badges",
+        nargs="+",
+        default=None,
+        help="Filter by signal badges (e.g. breakout high-debate)",
+    )
+    p_radar.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    # hn-archive
+    p_hn_arch = subparsers.add_parser(
+        "hn-archive",
+        help="Search the full historical Hacker News archive via Algolia",
+    )
+    p_hn_arch.add_argument("query", help="Full-text search query")
+    p_hn_arch.add_argument("--limit", type=int, default=15, help="Maximum stories to return")
+    p_hn_arch.add_argument(
+        "--sort",
+        choices=["relevance", "date"],
+        default="relevance",
+        help="Sort order (relevance or date)",
+    )
+    p_hn_arch.add_argument("--json", action="store_true", help="Output raw JSON")
+
+    # deep-dive
+    p_dd = subparsers.add_parser(
+        "deep-dive",
+        help="Compound research dossier across local + HN archives with cached summarization",
+    )
+    p_dd.add_argument("topic", help="Topic to research across Hacker News")
+    p_dd.add_argument(
+        "--max-stories",
+        dest="max_stories",
+        type=int,
+        default=3,
+        help="Maximum distinct stories to summarize",
+    )
+    p_dd.add_argument(
+        "--type",
+        choices=["quick", "technical", "bullet", "thai_concise"],
+        default="technical",
+        help="Summary style and depth",
+    )
+    p_dd.add_argument("--locale", default="en", help="Language code (e.g. en, th)")
+    p_dd.add_argument(
+        "--no-comments",
+        dest="comments",
+        action="store_false",
+        default=True,
+        help="Disable community comments",
+    )
+    p_dd.add_argument("--json", action="store_true", help="Output structured JSON")
 
     # mcp
     subparsers.add_parser("mcp", help="Run the optional Gojo FastMCP server over stdio")
