@@ -1,12 +1,14 @@
 """
 Command line interface for Gojo Hacker News workflow.
 Usage:
-    python -m gojo.cli list [--feed top|new] [--page 1]
-    python -m gojo.cli search <query>
+    python -m gojo.cli list [--feed top|new|best|ask|show] [--page 1] [--focus "..."] [--force]
+    python -m gojo.cli search <query> [--feed top|new|best|ask|show] [--focus "..."]
+    python -m gojo.cli archive-search <query> [--limit 10] [--json]
     python -m gojo.cli get <story_id>
     python -m gojo.cli summarize <story_id> [--type quick|technical|bullet|thai_concise] [--no-comments]
-    python -m gojo.cli briefing [--limit 10] [--locale th|en]
-    python -m gojo.cli providers
+    python -m gojo.cli briefing [--feed top|new|best|ask|show] [--limit 10] [--locale th|en] [--focus "..."] [--since-last] [--json]
+    python -m gojo.cli providers [--json]
+    python -m gojo.cli mcp
 """
 
 from __future__ import annotations
@@ -18,8 +20,23 @@ import os
 import sys
 
 from .agent_tools import filter_items_by_query
+from .mcp_server import run_mcp_server
+from .providers.hn import SUPPORTED_FEED_VARIANTS
 from .providers.llm import AutoLLMProvider, OllamaProvider
 from .service import GojoHNService
+from .signals import rank_items_by_focus
+
+_FEED_MAP: dict[str, str] = {
+    "top": "hn_top",
+    "new": "hn_new",
+    "best": "hn_best",
+    "ask": "hn_ask",
+    "show": "hn_show",
+}
+
+
+def _resolve_feed_id(feed_arg: str) -> str:
+    return _FEED_MAP.get(feed_arg, "hn_top")
 
 
 def _print_items(items, json_output: bool = False) -> None:
@@ -31,8 +48,10 @@ def _print_items(items, json_output: bool = False) -> None:
         print("No items found.")
         return
 
-    for i, it in enumerate(items, 1):
-        print(f"\033[1;36m[{it.external_id}]\033[0m \033[1m{it.title}\033[0m")
+    for it in items:
+        badges = getattr(it, "signal_badges", None) or []
+        badge_str = f" \033[1;33m[{', '.join(badges)}]\033[0m" if badges else ""
+        print(f"\033[1;36m[{it.external_id}]\033[0m \033[1m{it.title}\033[0m{badge_str}")
         meta = []
         if it.score is not None:
             meta.append(f"⭐ {it.score}")
@@ -50,23 +69,66 @@ async def _run_cli(args: argparse.Namespace) -> None:
     svc = GojoHNService()
     try:
         if args.command == "list":
-            feed_id = "hn_new" if args.feed == "new" else "hn_top"
-            res = await svc.list_feed(feed_id=feed_id, page=args.page, page_size=args.limit)
+            feed_id = _resolve_feed_id(args.feed)
+            res = await svc.list_feed(
+                feed_id=feed_id,
+                page=args.page,
+                page_size=args.limit,
+                force_refresh=getattr(args, "force", False),
+            )
+            items = res.items
+            focus = getattr(args, "focus", None)
+            if focus and focus.strip() and items:
+                items = [it for it, _score in rank_items_by_focus(items, focus.strip())]
+                res = res.model_copy(update={"items": items})
+
             if args.json:
                 print(json.dumps(res.model_dump(mode="json"), indent=2, ensure_ascii=False))
             else:
-                print(f"--- Hacker News ({feed_id.upper()}) Page {res.page} [Cache: {res.completion.cache_layer}] ---")
+                focus_note = f" | Focus: '{focus.strip()}'" if focus and focus.strip() else ""
+                print(
+                    f"--- Hacker News ({feed_id.upper()}) Page {res.page} "
+                    f"[Cache: {res.completion.cache_layer}]{focus_note} ---"
+                )
                 _print_items(res.items)
 
         elif args.command == "search":
-            feed_id = "hn_new" if args.feed == "new" else "hn_top"
+            feed_id = _resolve_feed_id(args.feed)
             res = await svc.list_feed(feed_id=feed_id, page=args.page, page_size=args.limit or 30)
             filtered = filter_items_by_query(res.items, args.query)
+            focus = getattr(args, "focus", None)
+            if focus and focus.strip() and filtered:
+                filtered = [it for it, _score in rank_items_by_focus(filtered, focus.strip())]
+
             if args.json:
                 print(json.dumps([it.model_dump(mode="json") for it in filtered], indent=2, ensure_ascii=False))
             else:
                 print(f"--- Search results for '{args.query}' in {feed_id.upper()} ---")
                 _print_items(filtered)
+
+        elif args.command == "archive-search":
+            artifacts = await svc.search_archive(query=args.query, limit=args.limit)
+            if args.json:
+                print(
+                    json.dumps(
+                        [art.model_dump(mode="json") for art in artifacts],
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(f"--- Local Archive Search for '{args.query}' ({len(artifacts)} matches) ---")
+                if not artifacts:
+                    print("No matching archived summaries found.")
+                for art in artifacts:
+                    print(
+                        f"\033[1;36m[{art.external_id}]\033[0m \033[1m{art.title or 'Untitled'}\033[0m "
+                        f"({art.summary_type}, {art.locale}) · Artifact: {art.id}"
+                    )
+                    takeaway = (art.summary_extra or {}).get("key_takeaway")
+                    if takeaway:
+                        print(f"    Takeaway: {takeaway}")
+                    print()
 
         elif args.command == "get":
             story = await svc.source.get_item(external_id=str(args.story_id))
@@ -85,7 +147,10 @@ async def _run_cli(args: argparse.Namespace) -> None:
 
         elif args.command == "summarize":
             comments_note = "with comments" if getattr(args, "comments", True) else "no comments"
-            print(f"Summarizing story {args.story_id} ({args.type}, locale: {args.locale}, {comments_note})...", file=sys.stderr)
+            print(
+                f"Summarizing story {args.story_id} ({args.type}, locale: {args.locale}, {comments_note})...",
+                file=sys.stderr,
+            )
             res = await svc.summarize(
                 external_id=str(args.story_id),
                 summary_type=args.type,
@@ -107,63 +172,129 @@ async def _run_cli(args: argparse.Namespace) -> None:
                         print(f"**{k}**: {v}")
 
         elif args.command == "briefing":
-            feed_id = "hn_new" if args.feed == "new" else "hn_top"
-            print(f"Generating Executive Briefing for {feed_id.upper()} (top {args.limit} stories, locale: {args.locale})...\n", file=sys.stderr)
+            feed_id = _resolve_feed_id(args.feed)
+            focus = getattr(args, "focus", None)
+            since_last = getattr(args, "since_last", False)
+            print(
+                f"Generating Executive Briefing for {feed_id.upper()} "
+                f"(top {args.limit} stories, locale: {args.locale})...\n",
+                file=sys.stderr,
+            )
             briefing_md = await svc.create_briefing(
                 feed_id=feed_id,
                 limit=args.limit,
                 locale=args.locale,
                 model=args.model,
+                focus=focus,
+                since_last=since_last,
             )
-            print(briefing_md)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "feed_id": feed_id,
+                            "limit": args.limit,
+                            "locale": args.locale,
+                            "focus": focus,
+                            "since_last": since_last,
+                            "briefing_markdown": briefing_md,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(briefing_md)
 
         elif args.command == "providers":
-            print("--- Gojo LLM Provider Status ---")
             has_openai = bool(os.getenv("OPENAI_API_KEY"))
             has_gemini = bool(os.getenv("GEMINI_API_KEY"))
-            print(f"• OpenAI API Key: {'[Configured]' if has_openai else '[Not Set]'}")
-            print(f"• Gemini API Key: {'[Configured]' if has_gemini else '[Not Set]'}")
 
             ollama = OllamaProvider()
-            ollama_ok = await ollama.is_available()
-            if ollama_ok:
-                models = await ollama.get_available_models()
-                print(f"• Local Ollama: [Active] at {ollama.base_url}")
-                print(f"  Installed models: {', '.join(models)}")
-            else:
-                print(f"• Local Ollama: [Not Running or No Models] ({ollama.base_url})")
-
             auto = AutoLLMProvider()
             try:
-                p = await auto.resolve_provider()
-                print(f"\nActive Auto-Selected Provider: \033[1;32m{p.provider_name.upper()}\033[0m")
-            except Exception as e:
-                print(f"\nActive Auto-Selected Provider: \033[1;31mNone ({e})\033[0m")
+                ollama_ok = await ollama.is_available()
+                ollama_models = await ollama.get_available_models() if ollama_ok else []
+                active_provider: str | None = None
+                active_error: str | None = None
+                try:
+                    p = await auto.resolve_provider()
+                    active_provider = p.provider_name
+                except Exception as e:
+                    active_error = str(e)
+            finally:
+                await ollama.close()
+                await auto.close()
+
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "openai_configured": has_openai,
+                            "gemini_configured": has_gemini,
+                            "ollama_available": ollama_ok,
+                            "ollama_base_url": ollama.base_url,
+                            "ollama_models": ollama_models,
+                            "active_provider": active_provider,
+                            "active_error": active_error,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print("--- Gojo LLM Provider Status ---")
+                print(f"• OpenAI API Key: {'[Configured]' if has_openai else '[Not Set]'}")
+                print(f"• Gemini API Key: {'[Configured]' if has_gemini else '[Not Set]'}")
+                if ollama_ok:
+                    print(f"• Local Ollama: [Active] at {ollama.base_url}")
+                    print(f"  Installed models: {', '.join(ollama_models)}")
+                else:
+                    print(f"• Local Ollama: [Not Running or No Models] ({ollama.base_url})")
+
+                if active_provider:
+                    print(f"\nActive Auto-Selected Provider: \033[1;32m{active_provider.upper()}\033[0m")
+                else:
+                    print(f"\nActive Auto-Selected Provider: \033[1;31mNone ({active_error})\033[0m")
 
         else:
-            print("Please specify a command: list, search, get, summarize, briefing, or providers. Run with --help for details.")
+            print(
+                "Please specify a command: list, search, archive-search, get, summarize, "
+                "briefing, providers, or mcp. Run with --help for details."
+            )
     finally:
         await svc.close()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the Gojo CLI argument parser."""
     parser = argparse.ArgumentParser(description="Gojo Standalone Hacker News CLI")
     subparsers = parser.add_subparsers(dest="command")
+    feed_choices = list(SUPPORTED_FEED_VARIANTS)
 
     # list
-    p_list = subparsers.add_parser("list", help="List Hacker News front page or new stories")
-    p_list.add_argument("--feed", choices=["top", "new"], default="top", help="Feed to fetch")
+    p_list = subparsers.add_parser("list", help="List Hacker News stories from a feed")
+    p_list.add_argument("--feed", choices=feed_choices, default="top", help="Feed to fetch")
     p_list.add_argument("--page", type=int, default=1, help="Page number (1-based)")
     p_list.add_argument("--limit", type=int, default=15, help="Number of items to fetch")
+    p_list.add_argument("--focus", default=None, help="BM25 focus query to re-rank stories")
+    p_list.add_argument("--force", action="store_true", help="Bypass feed cache and refresh from origin")
     p_list.add_argument("--json", action="store_true", help="Output raw JSON")
 
     # search
     p_search = subparsers.add_parser("search", help="Search headlines in feed")
     p_search.add_argument("query", help="Title substring query")
-    p_search.add_argument("--feed", choices=["top", "new"], default="top", help="Feed to search")
+    p_search.add_argument("--feed", choices=feed_choices, default="top", help="Feed to search")
     p_search.add_argument("--page", type=int, default=1, help="Page number")
     p_search.add_argument("--limit", type=int, default=30, help="Number of stories to scan")
+    p_search.add_argument("--focus", default=None, help="BM25 focus query to re-rank matches")
     p_search.add_argument("--json", action="store_true", help="Output raw JSON")
+
+    # archive-search
+    p_arch = subparsers.add_parser("archive-search", help="Search local SQLite FTS5 summary archive")
+    p_arch.add_argument("query", help="Full-text search query")
+    p_arch.add_argument("--limit", type=int, default=10, help="Maximum matching artifacts")
+    p_arch.add_argument("--json", action="store_true", help="Output raw JSON")
 
     # get
     p_get = subparsers.add_parser("get", help="Get raw story details by ID")
@@ -182,22 +313,54 @@ def main() -> None:
     p_sum.add_argument("--locale", default="en", help="Language code (e.g. en, th)")
     p_sum.add_argument("--model", default=None, help="Model override")
     p_sum.add_argument("--force", action="store_true", help="Force regenerate instead of cache")
-    p_sum.add_argument("--no-comments", dest="comments", action="store_false", default=True, help="Disable community comments")
+    p_sum.add_argument(
+        "--no-comments",
+        dest="comments",
+        action="store_false",
+        default=True,
+        help="Disable community comments",
+    )
     p_sum.add_argument("--json", action="store_true", help="Output full JSON response")
 
     # briefing
     p_brief = subparsers.add_parser("briefing", help="Generate executive technical briefing for top stories")
-    p_brief.add_argument("--feed", choices=["top", "new"], default="top", help="Feed to synthesize")
+    p_brief.add_argument("--feed", choices=feed_choices, default="top", help="Feed to synthesize")
     p_brief.add_argument("--limit", type=int, default=10, help="Number of stories to include (default 10)")
     p_brief.add_argument("--locale", default="th", help="Language code (e.g. th, en)")
     p_brief.add_argument("--model", default=None, help="Model override")
+    p_brief.add_argument("--focus", default=None, help="BM25 focus profile to prioritize stories")
+    p_brief.add_argument(
+        "--since-last",
+        dest="since_last",
+        action="store_true",
+        default=False,
+        help="Annotate NEW and surging stories compared to prior snapshot",
+    )
+    p_brief.add_argument("--json", action="store_true", help="Output structured JSON")
 
     # providers
-    subparsers.add_parser("providers", help="Inspect available LLM providers and models")
+    p_prov = subparsers.add_parser("providers", help="Inspect available LLM providers and models")
+    p_prov.add_argument("--json", action="store_true", help="Output structured JSON")
 
+    # mcp
+    subparsers.add_parser("mcp", help="Run the optional Gojo FastMCP server over stdio")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
+        return
+
+    if args.command == "mcp":
+        try:
+            run_mcp_server()
+        except ImportError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
         return
 
     asyncio.run(_run_cli(args))
