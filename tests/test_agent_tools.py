@@ -1,15 +1,22 @@
-from unittest.mock import AsyncMock
+import builtins
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from gojo.agent_tools import (
     HN_AGENT_TOOL_DEFINITIONS,
     filter_items_by_query,
+    format_archive_search_for_agent,
     format_search_for_agent,
     format_summary_for_agent,
+    tool_briefing_hn,
+    tool_get_artifact,
     tool_get_hn_story,
+    tool_search_archive,
     tool_search_hn,
     tool_summarize_hn,
 )
+from gojo.cli import build_parser
 from gojo.types import (
     DigestArtifact,
     DigestCompletion,
@@ -34,12 +41,20 @@ def test_filter_items_by_query() -> None:
 
 
 def test_agent_tool_definitions_valid() -> None:
-    assert len(HN_AGENT_TOOL_DEFINITIONS) >= 3
-    names = [t["function"]["name"] for t in HN_AGENT_TOOL_DEFINITIONS]
-    assert "hn_search" in names
-    assert "hn_summarize" in names
-    assert "hn_briefing" in names
-    assert "hn_get_story" in names
+    assert len(HN_AGENT_TOOL_DEFINITIONS) >= 6
+    by_name = {t["function"]["name"]: t["function"] for t in HN_AGENT_TOOL_DEFINITIONS}
+    assert "hn_search" in by_name
+    assert "hn_summarize" in by_name
+    assert "hn_briefing" in by_name
+    assert "hn_get_story" in by_name
+    assert "hn_search_archive" in by_name
+    assert "hn_get_artifact" in by_name
+
+    # Verify reconciled defaults and 5-feed enum
+    search_feeds = by_name["hn_search"]["parameters"]["properties"]["feed_id"]["enum"]
+    assert set(search_feeds) == {"hn_top", "hn_new", "hn_best", "hn_ask", "hn_show"}
+    assert "focus" in by_name["hn_search"]["parameters"]["properties"]
+    assert by_name["hn_briefing"]["parameters"]["properties"]["locale"]["default"] == "th"
 
 
 @pytest.mark.asyncio
@@ -55,20 +70,37 @@ async def test_tool_search_hn() -> None:
                 title="Antigravity v2",
                 score=100,
                 descendants=25,
-            )
+                signal_badges=["breakout", "high-debate"],
+            ),
+            DigestFeedItem(
+                feed_provider="hn",
+                external_id="11",
+                title="Antigravity Gardening Tips",
+                score=10,
+                descendants=1,
+            ),
         ],
         has_more=False,
         completion=DigestCompletion(status="success", cache_layer="origin"),
     )
 
-    out = await tool_search_hn(mock_svc, feed_id="hn_top", page=1, query="antigravity")
+    out = await tool_search_hn(
+        mock_svc, feed_id="hn_top", page=1, query="antigravity", focus="v2"
+    )
     assert out["feed_id"] == "hn_top"
-    assert out["total_returned"] == 1
+    assert out["total_returned"] == 2
+    assert out["focus_applied"] is True
     assert out["items"][0]["title"] == "Antigravity v2"
 
     fmt = format_search_for_agent(out)
     assert "Antigravity v2" in fmt
     assert "Score: 100" in fmt
+    assert "[breakout, high-debate]" in fmt
+
+    # max_chars token budget enforcement
+    capped = format_search_for_agent(out, max_chars=80)
+    assert len(capped) <= 80
+    assert capped.endswith("... [truncated]")
 
 
 @pytest.mark.asyncio
@@ -82,7 +114,7 @@ async def test_tool_summarize_hn() -> None:
             title="Antigravity v2",
             locale="en",
             prompt_version="v5",
-            summary_markdown="## Summary\nGreat release.",
+            summary_markdown="## Summary\nGreat release with lots of technical details.",
         ),
         completion=DigestCompletion(status="success", cache_layer="origin"),
     )
@@ -93,3 +125,97 @@ async def test_tool_summarize_hn() -> None:
     fmt = format_summary_for_agent(out)
     assert "Antigravity v2" in fmt
     assert "Great release" in fmt
+
+    capped = format_summary_for_agent(out, max_chars=90)
+    assert len(capped) <= 90
+    assert capped.endswith("... [truncated]")
+
+
+@pytest.mark.asyncio
+async def test_tool_briefing_hn_default_locale_th() -> None:
+    mock_svc = AsyncMock()
+    mock_svc.create_briefing.return_value = "# Executive Technology Briefing\nThai summary."
+
+    out = await tool_briefing_hn(mock_svc, feed_id="hn_best", limit=12, focus="AI", since_last=True)
+    assert out["locale"] == "th"
+    assert out["feed_id"] == "hn_best"
+    assert out["focus"] == "AI"
+    assert out["since_last"] is True
+    mock_svc.create_briefing.assert_awaited_once_with(
+        feed_id="hn_best", limit=12, locale="th", focus="AI", since_last=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_search_archive_and_get_artifact() -> None:
+    art = DigestArtifact(
+        fingerprint="def" * 21 + "d",
+        feed_provider="hn",
+        external_id="42",
+        title="SQLite WAL Internals",
+        locale="en",
+        prompt_version="v5",
+        summary_markdown="## Summary\nWAL enables concurrent readers.",
+        summary_extra={"key_takeaway": "WAL improves concurrency."},
+    )
+    mock_svc = AsyncMock()
+    mock_svc.search_archive.return_value = [art]
+    mock_svc.get_artifact.return_value = art
+
+    arch_out = await tool_search_archive(mock_svc, query="SQLite", limit=5)
+    assert arch_out["total_returned"] == 1
+    assert arch_out["artifacts"][0]["title"] == "SQLite WAL Internals"
+
+    fmt_arch = format_archive_search_for_agent(arch_out)
+    assert "SQLite WAL Internals" in fmt_arch
+    assert "WAL improves concurrency." in fmt_arch
+
+    got = await tool_get_artifact(mock_svc, artifact_id=art.id)
+    assert got is not None
+    assert got["id"] == art.id
+
+
+def test_cli_parser_new_flags_and_subcommands() -> None:
+    parser = build_parser()
+
+    args_list = parser.parse_args(["list", "--feed", "best", "--focus", "rust", "--force", "--json"])
+    assert args_list.feed == "best"
+    assert args_list.focus == "rust"
+    assert args_list.force is True
+    assert args_list.json is True
+
+    args_brief = parser.parse_args(
+        ["briefing", "--feed", "ask", "--limit", "20", "--focus", "security", "--since-last", "--json"]
+    )
+    assert args_brief.feed == "ask"
+    assert args_brief.limit == 20
+    assert args_brief.focus == "security"
+    assert args_brief.since_last is True
+    assert args_brief.json is True
+
+    args_arch = parser.parse_args(["archive-search", "sqlite", "--limit", "5", "--json"])
+    assert args_arch.command == "archive-search"
+    assert args_arch.query == "sqlite"
+    assert args_arch.limit == 5
+
+    args_prov = parser.parse_args(["providers", "--json"])
+    assert args_prov.json is True
+
+    args_mcp = parser.parse_args(["mcp"])
+    assert args_mcp.command == "mcp"
+
+
+def test_mcp_server_import_safety_and_actionable_error() -> None:
+    import gojo.mcp_server as mcp_mod
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "mcp" or name.startswith("mcp."):
+            raise ImportError("No module named 'mcp'")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=fake_import):
+        with pytest.raises(ImportError) as exc_info:
+            mcp_mod.create_mcp_server()
+        assert 'pip install -e ".[mcp]"' in str(exc_info.value)
