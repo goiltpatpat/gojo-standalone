@@ -4,10 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gojo-hn"
-version = "1.0.0"
-description = "Standalone production-grade Hacker News workflow and agent tools"
+version = "2.1.0"
+description = "Gojo Standalone (Six Eyes / Rikugan) — Autonomous Hacker News intelligence engine, signal radar, and AI agent toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = [
+    "hacker-news",
+    "ai-agents",
+    "mcp",
+    "llm",
+    "intelligence",
+    "digest",
+    "six-eyes",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.25.0",
     "pydantic>=2.5.0",
@@ -24,13 +43,33 @@ mcp = [
 docs = [
     "pypdf>=4.0.0",
 ]
+all = [
+    "openai>=1.0.0",
+    "mcp>=1.0.0",
+    "pypdf>=4.0.0",
+]
 test = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
 ]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.6.0",
+]
 
 [project.scripts]
 gojo-hn = "gojo.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gojo*"]
+
+[tool.setuptools.package-data]
+gojo = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

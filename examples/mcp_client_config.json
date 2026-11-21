@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "gojo-hn": {
+      "command": "python3",
+      "args": ["-m", "gojo.cli", "mcp"],
+      "env": {
+        "OPENAI_API_KEY": "",
+        "GEMINI_API_KEY": "",
+        "GOJO_HN_MODEL": "gpt-4o-mini",
+        "GOJO_HN_DB_PATH": "gojo_hn.db",
+        "GOJO_HN_JINA_FALLBACK": "true"
+      }
+    }
+  }
+}
