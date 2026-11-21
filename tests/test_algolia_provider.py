@@ -96,6 +96,20 @@ def test_score_comment_subtree_prefers_rich_nested_thread() -> None:
     assert s_deep[3] == 24  # points
 
 
+def test_score_comment_subtree_does_not_double_prune_angle_brackets() -> None:
+    """Already-pruned nodes containing literal `<...>` (e.g. `std::vector<int>`) must not be re-pruned."""
+    pruned_node = {
+        "id": 77,
+        "author": "cpp_dev",
+        "depth": 0,
+        "text": "Use std::vector<int> instead!",
+        "points": 10,
+        "children": [],
+    }
+    score = score_comment_subtree(pruned_node, _pruned=True)
+    assert score == (0, len("Use std::vector<int> instead!"), 1, 10)
+
+
 @pytest.mark.asyncio
 async def test_algolia_provider_fetch_discussion_context_subtree_ranking_and_paths() -> None:
     provider = HackerNewsAlgoliaProvider()

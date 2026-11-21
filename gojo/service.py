@@ -179,8 +179,8 @@ class GojoHNService:
 
         if llm_provider is not None:
             self.llm_provider = llm_provider
-        elif self.api_key:
-            self.llm_provider = OpenAIProvider(api_key=self.api_key)
+        elif openai_api_key:
+            self.llm_provider = OpenAIProvider(api_key=openai_api_key)
         else:
             self.llm_provider = AutoLLMProvider()
 
@@ -621,6 +621,8 @@ class GojoHNService:
 
     async def _fetch_via_jina_reader(self, article_url: str) -> str:
         """Fallback to Jina Reader (https://r.jina.ai/) for reader-mode Markdown (preserving newlines)."""
+        if not is_public_http_url_for_fetch(article_url):
+            return ""
         jina_url = f"https://r.jina.ai/{article_url}"
         headers = {
             "User-Agent": (

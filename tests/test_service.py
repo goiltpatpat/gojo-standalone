@@ -391,3 +391,34 @@ async def test_service_search_archive_and_hn_archive() -> None:
     assert arch_hits == []
 
     await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_service_uses_auto_llm_provider_when_openai_key_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPENAI_API_KEY in env must still use AutoLLMProvider (keeping failover/cooldowns active);
+    only explicit openai_api_key pins OpenAIProvider directly."""
+    from gojo.providers.llm import AutoLLMProvider, OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key")
+
+    svc_env = GojoHNService(storage=MemoryStorage())
+    assert isinstance(svc_env.llm_provider, AutoLLMProvider)
+    await svc_env.close()
+
+    svc_explicit = GojoHNService(storage=MemoryStorage(), openai_api_key="sk-explicit-key")
+    assert isinstance(svc_explicit.llm_provider, OpenAIProvider)
+    await svc_explicit.close()
+
+
+@pytest.mark.asyncio
+async def test_service_jina_reader_blocks_private_urls_directly() -> None:
+    """Defense-in-depth: direct calls to _fetch_via_jina_reader must reject private/loopback URLs."""
+    svc = GojoHNService(storage=MemoryStorage(), enable_jina_fallback=True)
+    with patch.object(svc, "_safe_fetch_response", new_callable=AsyncMock) as mock_fetch:
+        assert await svc._fetch_via_jina_reader("http://169.254.169.254/latest/meta-data/") == ""
+        assert await svc._fetch_via_jina_reader("http://127.0.0.1:8080/admin") == ""
+        assert await svc._fetch_via_jina_reader("http://10.0.0.1/internal") == ""
+        mock_fetch.assert_not_called()
+    await svc.close()

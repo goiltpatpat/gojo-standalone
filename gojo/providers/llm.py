@@ -505,19 +505,17 @@ class AutoLLMProvider(LLMProvider):
         max_tokens: int = 4096,
     ) -> str:
         errors: list[str] = []
-        attempted_count = 0
 
         candidates = await self._iter_candidates()
 
         # Evaluate cloud / explicit candidates first
-        for provider in candidates:
+        for idx, provider in enumerate(candidates):
             name = provider.provider_name
             if self._is_in_cooldown(name):
                 errors.append(f"{name}: skipped (cooldown active)")
                 continue
 
-            effective_model = model if attempted_count == 0 else None
-            attempted_count += 1
+            effective_model = model if idx == 0 else None
             try:
                 return await self._try_provider(
                     provider,
@@ -536,8 +534,7 @@ class AutoLLMProvider(LLMProvider):
             else:
                 ollama = self._get_or_create_ollama()
                 if await ollama.is_available():
-                    effective_model = model if attempted_count == 0 else None
-                    attempted_count += 1
+                    effective_model = model if len(candidates) == 0 else None
                     try:
                         return await self._try_provider(
                             ollama,

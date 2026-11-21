@@ -219,3 +219,70 @@ def test_mcp_server_import_safety_and_actionable_error() -> None:
         with pytest.raises(ImportError) as exc_info:
             mcp_mod.create_mcp_server()
         assert 'pip install -e ".[mcp]"' in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_tool_parity_and_shared_lazy_service() -> None:
+    import json
+    import gojo.mcp_server as mcp_mod
+
+    class _FakeFastMCP:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.tools: dict[str, object] = {}
+
+        def tool(self):
+            def decorator(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+    art = DigestArtifact(
+        fingerprint="mcp" * 21 + "m",
+        feed_provider="hn",
+        external_id="42",
+        title="MCP Parity Story",
+        locale="en",
+        prompt_version="v5",
+        summary_markdown="## Summary\nArtifact details.",
+    )
+    mock_svc = AsyncMock()
+    mock_svc.get_artifact.return_value = art
+    mock_svc.source.get_item.return_value = {"id": 42, "title": "MCP Parity Story"}
+
+    factory_calls = 0
+
+    def fake_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return mock_svc
+
+    with patch.object(mcp_mod, "_import_fastmcp", return_value=_FakeFastMCP):
+        server = mcp_mod.create_mcp_server(service_factory=fake_factory)
+
+    # Full parity with HN_AGENT_TOOL_DEFINITIONS (6 tools)
+    expected_tools = {t["function"]["name"] for t in HN_AGENT_TOOL_DEFINITIONS}
+    assert set(server.tools.keys()) == expected_tools
+    assert "hn_get_artifact" in server.tools
+
+    # Lazy instantiation: factory not called yet
+    assert factory_calls == 0
+
+    # Calling multiple tools reuses a single shared service without closing per call
+    got_art_json = await server.tools["hn_get_artifact"](artifact_id=art.id)
+    got_art = json.loads(got_art_json)
+    assert got_art["id"] == art.id
+    assert got_art["title"] == "MCP Parity Story"
+
+    got_story_json = await server.tools["hn_get_story"](external_id="42")
+    got_story = json.loads(got_story_json)
+    assert got_story["id"] == 42
+
+    # Not-found artifact returns structured JSON error
+    mock_svc.get_artifact.return_value = None
+    missing_json = await server.tools["hn_get_artifact"](artifact_id="nonexistent")
+    assert "error" in json.loads(missing_json)
+
+    assert factory_calls == 1
+    mock_svc.close.assert_not_awaited()

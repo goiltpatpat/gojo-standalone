@@ -292,6 +292,12 @@ class SQLiteStorage(StorageBackend):
                         artifact.created_by_user_id,
                     ),
                 )
+                row = conn.execute(
+                    "SELECT id FROM hn_artifacts WHERE fingerprint = ? LIMIT 1;",
+                    (artifact.fingerprint,),
+                ).fetchone()
+            if row is not None and row["id"] != artifact.id:
+                return artifact.model_copy(update={"id": row["id"]})
             return artifact
         finally:
             conn.close()

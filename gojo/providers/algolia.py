@@ -132,13 +132,15 @@ def score_comment_subtree(
     node: dict[str, Any],
     *,
     max_depth: int = 3,
+    _pruned: bool = False,
 ) -> tuple[int, int, int, int]:
     """
     Score a top-level comment's subtree by:
       (total_descendants, substantive_char_weight, depth_diversity, points)
-    Accepts either a raw Algolia comment dict or an already-pruned subtree node.
+    Accepts either a raw Algolia comment dict or an already-pruned subtree node
+    (pass `_pruned=True` to skip re-pruning already-cleaned nodes).
     """
-    if "points" in node and isinstance(node.get("text"), str) and "<" not in node["text"] and "depth" in node:
+    if _pruned:
         pruned_roots = [node]
     else:
         pruned_roots = _prune_comment_subtree(node, depth=0, max_depth=max_depth)
@@ -301,7 +303,10 @@ class HackerNewsAlgoliaProvider:
         # Rank top-level subtrees by (total_descendants, substantive_char_weight, depth_diversity, points)
         ranked_roots = sorted(
             enumerate(pruned_roots),
-            key=lambda pair: (score_comment_subtree(pair[1], max_depth=max_depth), -pair[0]),
+            key=lambda pair: (
+                score_comment_subtree(pair[1], max_depth=max_depth, _pruned=True),
+                -pair[0],
+            ),
             reverse=True,
         )
 

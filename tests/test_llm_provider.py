@@ -205,11 +205,14 @@ async def test_auto_llm_failover_cascade_and_cooldown() -> None:
     assert p_gemini.calls[0]["model"] is None
     assert p_gemini.calls[0]["effective_model"] == "gemini-2.5-flash"
 
-    # Second call: OpenAI is in cooldown so it is skipped completely
-    res2 = await auto.complete(system_prompt="sys", user_message="msg")
+    # Second call: OpenAI is in cooldown so it is skipped completely,
+    # and primary's model ("gpt-4o") must NOT leak to secondary provider Gemini.
+    res2 = await auto.complete(system_prompt="sys", user_message="msg", model="gpt-4o")
     assert res2 == "Gemini rescued"
     assert len(p_openai.calls) == 1
     assert len(p_gemini.calls) == 2
+    assert p_gemini.calls[1]["model"] is None
+    assert p_gemini.calls[1]["effective_model"] == "gemini-2.5-flash"
 
     await auto.close()
     assert p_openai.closed and p_gemini.closed and p_ollama.closed

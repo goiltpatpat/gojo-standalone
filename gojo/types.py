@@ -11,7 +11,7 @@ import uuid
 from pydantic import BaseModel, Field
 
 FeedProviderId = Literal["hn"]
-DigestFeedId = Literal["hn_top", "hn_new"]
+DigestFeedId = Literal["hn_top", "hn_new", "hn_best", "hn_ask", "hn_show"]
 SummaryType = Literal["quick", "technical", "bullet", "thai_concise"]
 DigestCacheLayer = Literal["memory", "sqlite", "origin"]
 
