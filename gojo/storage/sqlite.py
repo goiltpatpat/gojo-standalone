@@ -6,7 +6,7 @@ Stores artifacts, feed cache, FTS5 search index, and story snapshots in a local 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from ..types import DigestArtifact, DigestFeedItem, artifact_row_to_model
-from .base import StorageBackend
+from .base import StorageBackend, build_topic_timeline, parse_topic_clauses
 
 _SNAPSHOT_CHUNK_SIZE = 500
 
@@ -204,14 +204,34 @@ class SQLiteStorage(StorageBackend):
                         rank INTEGER NOT NULL,
                         score INTEGER,
                         descendants INTEGER,
-                        seen_at TEXT NOT NULL
+                        seen_at TEXT NOT NULL,
+                        title TEXT DEFAULT '',
+                        url TEXT DEFAULT ''
                     );
                     """
                 )
+                existing_snap_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(hn_story_snapshots);").fetchall()
+                }
+                if "title" not in existing_snap_cols:
+                    conn.execute(
+                        "ALTER TABLE hn_story_snapshots ADD COLUMN title TEXT DEFAULT '';"
+                    )
+                if "url" not in existing_snap_cols:
+                    conn.execute(
+                        "ALTER TABLE hn_story_snapshots ADD COLUMN url TEXT DEFAULT '';"
+                    )
                 conn.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_hn_story_snapshots_ext_seen
                     ON hn_story_snapshots(external_id, seen_at DESC, id DESC);
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_hn_story_snapshots_seen_at
+                    ON hn_story_snapshots(seen_at DESC);
                     """
                 )
         finally:
@@ -445,6 +465,8 @@ class SQLiteStorage(StorageBackend):
                 item.score,
                 item.descendants,
                 now_iso,
+                item.title or "",
+                item.url or "",
             )
             for rank, item in enumerate(items, start=1)
         ]
@@ -454,8 +476,8 @@ class SQLiteStorage(StorageBackend):
                 conn.executemany(
                     """
                     INSERT INTO hn_story_snapshots (
-                        external_id, feed_id, rank, score, descendants, seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?);
+                        external_id, feed_id, rank, score, descendants, seen_at, title, url
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     rows,
                 )
@@ -518,3 +540,94 @@ class SQLiteStorage(StorageBackend):
         self, external_ids: list[str]
     ) -> dict[str, dict[str, Any]]:
         return await asyncio.to_thread(self._get_latest_snapshots_sync, external_ids)
+
+    def _query_snapshots_since_sync(self, cutoff_iso: str) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT external_id, feed_id, rank, score, descendants, seen_at, title, url
+                FROM hn_story_snapshots
+                WHERE seen_at >= ?
+                ORDER BY seen_at ASC, id ASC;
+                """,
+                (cutoff_iso,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    async def get_topic_timeline(
+        self, topic: str, *, days: int = 30, limit: int = 50
+    ) -> dict[str, Any]:
+        clauses = parse_topic_clauses(topic)
+        window_days = max(0, int(days))
+        if not clauses or window_days <= 0 or limit <= 0:
+            return build_topic_timeline(topic, window_days, max(0, int(limit)), [], [])
+
+        now = datetime.now(timezone.utc)
+        # Pad SQL cutoff by 1 day to avoid excluding rows with non-UTC ISO offsets;
+        # build_topic_timeline enforces the exact UTC cutoff.
+        sql_cutoff_iso = (now - timedelta(days=window_days + 1)).isoformat()
+        snapshots = await asyncio.to_thread(self._query_snapshots_since_sync, sql_cutoff_iso)
+
+        art_limit = min(limit, 15)
+        if len(clauses) == 1:
+            artifacts = await self.search_artifacts(topic, limit=art_limit)
+        else:
+            seen_ids: set[str] = set()
+            artifacts = []
+            for clause in clauses:
+                hits = await self.search_artifacts(" ".join(clause), limit=art_limit)
+                for art in hits:
+                    if art.id not in seen_ids:
+                        seen_ids.add(art.id)
+                        artifacts.append(art)
+                        if len(artifacts) >= art_limit:
+                            break
+                if len(artifacts) >= art_limit:
+                    break
+
+        return build_topic_timeline(
+            topic, window_days, limit, snapshots, artifacts, now=now
+        )
+
+    def _get_recent_interest_corpus_sync(self, limit: int) -> list[dict[str, str]]:
+        if limit <= 0:
+            return []
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                SELECT title, source_url, summary_extra, created_at
+                FROM hn_artifacts
+                ORDER BY rowid DESC
+                LIMIT ?;
+                """,
+                (limit,),
+            )
+            corpus: list[dict[str, str]] = []
+            for row in cur.fetchall():
+                extra_raw = row["summary_extra"]
+                key_takeaway = ""
+                if extra_raw:
+                    try:
+                        parsed = json.loads(extra_raw)
+                        if isinstance(parsed, dict):
+                            key_takeaway = str(parsed.get("key_takeaway") or "")
+                    except Exception:
+                        key_takeaway = ""
+                corpus.append(
+                    {
+                        "title": str(row["title"] or ""),
+                        "key_takeaway": key_takeaway,
+                        "source_url": str(row["source_url"] or ""),
+                        "created_at": str(row["created_at"] or ""),
+                    }
+                )
+            return corpus
+        finally:
+            conn.close()
+
+    async def get_recent_interest_corpus(self, *, limit: int = 40) -> list[dict[str, str]]:
+        return await asyncio.to_thread(self._get_recent_interest_corpus_sync, limit)
