@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gojo-hn"
-version = "2.1.0"
+version = "2.2.0"
 description = "Gojo Standalone (Six Eyes / Rikugan) — Autonomous Hacker News intelligence engine, signal radar, and AI agent toolkit"
 readme = "README.md"
 requires-python = ">=3.10"

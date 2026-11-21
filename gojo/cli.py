@@ -1,15 +1,16 @@
 """
-Command line interface for Gojo Hacker News workflow.
+Command line interface for Gojo Hacker News & Multi-Sensor workflow.
 Usage:
-    python -m gojo.cli list [--feed top|new|best|ask|show] [--page 1] [--focus "..."] [--force]
-    python -m gojo.cli search <query> [--feed top|new|best|ask|show] [--focus "..."]
-    python -m gojo.cli radar [--feeds top best] [--top 10] [--focus "..."] [--badges breakout] [--json]
+    python -m gojo.cli list [--feed top|new|best|ask|show|lobsters_hot|lobsters_new|github_trending] [--page 1] [--focus "..."] [--force]
+    python -m gojo.cli search <query> [--feed top|new|best|ask|show|lobsters_hot|lobsters_new|github_trending] [--focus "..."]
+    python -m gojo.cli radar [--feeds top best] [--top 10] [--focus "..."] [--badges breakout] [--personalized] [--multi-sensor] [--json]
+    python -m gojo.cli pulse <topic> [--days 30] [--limit 50] [--json]
     python -m gojo.cli hn-archive <query> [--limit 15] [--sort relevance|date] [--json]
     python -m gojo.cli archive-search <query> [--limit 10] [--json]
     python -m gojo.cli get <story_id>
     python -m gojo.cli summarize <story_id> [--type quick|technical|bullet|thai_concise] [--no-comments]
     python -m gojo.cli deep-dive <topic> [--max-stories 3] [--type technical] [--locale en] [--json]
-    python -m gojo.cli briefing [--feed top|new|best|ask|show] [--limit 10] [--locale th|en] [--focus "..."] [--since-last] [--json]
+    python -m gojo.cli briefing [--feed top|new|best|ask|show|lobsters_hot|lobsters_new|github_trending] [--limit 10] [--locale th|en] [--focus "..."] [--since-last] [--json]
     python -m gojo.cli providers [--json]
     python -m gojo.cli mcp
 """
@@ -26,12 +27,14 @@ from .agent_tools import (
     filter_items_by_query,
     format_deep_dive_for_agent,
     format_radar_for_agent,
+    format_topic_pulse_for_agent,
 )
 from .mcp_server import run_mcp_server
 from .providers.hn import SUPPORTED_FEED_VARIANTS
 from .providers.llm import AutoLLMProvider, OllamaProvider
 from .service import GojoHNService
 from .signals import rank_items_by_focus
+from .types import ALL_SUPPORTED_FEED_IDS
 
 _FEED_MAP: dict[str, str] = {
     "top": "hn_top",
@@ -39,14 +42,18 @@ _FEED_MAP: dict[str, str] = {
     "best": "hn_best",
     "ask": "hn_ask",
     "show": "hn_show",
+    "lobsters_hot": "lobsters_hot",
+    "lobsters_new": "lobsters_new",
+    "github_trending": "github_trending",
 }
 
 
 def _resolve_feed_id(feed_arg: str) -> str:
-    if feed_arg in _FEED_MAP:
-        return _FEED_MAP[feed_arg]
-    if feed_arg.startswith("hn_") and feed_arg.removeprefix("hn_") in _FEED_MAP:
-        return feed_arg
+    cleaned = (feed_arg or "").strip()
+    if cleaned in _FEED_MAP:
+        return _FEED_MAP[cleaned]
+    if cleaned in ALL_SUPPORTED_FEED_IDS:
+        return cleaned
     return "hn_top"
 
 
@@ -291,11 +298,24 @@ async def _run_cli(args: argparse.Namespace) -> None:
                 top_n=args.top,
                 focus=getattr(args, "focus", None),
                 badges=badges,
+                personalized=getattr(args, "personalized", False),
+                include_sensors=getattr(args, "multi_sensor", False),
             )
             if args.json:
                 print(json.dumps(res, indent=2, ensure_ascii=False))
             else:
                 print(format_radar_for_agent(res))
+
+        elif args.command == "pulse":
+            res = await svc.topic_pulse(
+                topic=args.topic,
+                days=args.days,
+                limit=args.limit,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(format_topic_pulse_for_agent(res))
 
         elif args.command == "hn-archive":
             items = await svc.search_hn_archive(
@@ -338,16 +358,20 @@ async def _run_cli(args: argparse.Namespace) -> None:
 
         else:
             print(
-                "Please specify a command: list, search, radar, hn-archive, archive-search, "
+                "Please specify a command: list, search, radar, pulse, hn-archive, archive-search, "
                 "get, summarize, deep-dive, briefing, providers, or mcp. Run with --help for details."
             )
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the Gojo CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Gojo Standalone Hacker News CLI")
+    parser = argparse.ArgumentParser(description="Gojo Standalone Six Eyes CLI")
     subparsers = parser.add_subparsers(dest="command")
-    feed_choices = list(SUPPORTED_FEED_VARIANTS)
+    feed_choices = list(SUPPORTED_FEED_VARIANTS) + [
+        "lobsters_hot",
+        "lobsters_new",
+        "github_trending",
+    ]
 
     # list
     p_list = subparsers.add_parser("list", help="List Hacker News stories from a feed")
@@ -422,13 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
     # radar
     p_radar = subparsers.add_parser(
         "radar",
-        help="Zero-LLM-token Six Eyes Signal Radar across multiple HN feeds",
+        help="Zero-LLM-token Six Eyes Signal Radar across HN and multi-sensor feeds",
     )
     p_radar.add_argument(
         "--feeds",
         nargs="+",
         default=None,
-        help="Feeds to scan (e.g. top best ask or comma-separated top,best)",
+        help="Feeds to scan (e.g. top best lobsters_hot github_trending or comma-separated)",
     )
     p_radar.add_argument("--top", type=int, default=10, help="Maximum top stories to return")
     p_radar.add_argument("--focus", default=None, help="BM25 focus query to re-rank stories")
@@ -436,9 +460,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--badges",
         nargs="+",
         default=None,
-        help="Filter by signal badges (e.g. breakout high-debate)",
+        help="Filter by signal badges (e.g. breakout high-debate corroborated)",
+    )
+    p_radar.add_argument(
+        "--personalized",
+        action="store_true",
+        default=False,
+        help="Apply learned adaptive focus profile from local summary history",
+    )
+    p_radar.add_argument(
+        "--multi-sensor",
+        dest="multi_sensor",
+        action="store_true",
+        default=False,
+        help="Include lobsters_hot and github_trending alongside HN feeds for cross-source corroboration",
     )
     p_radar.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    # pulse
+    p_pulse = subparsers.add_parser(
+        "pulse",
+        help="Temporal memory pulse/timeline for a topic across historical snapshots and archive",
+    )
+    p_pulse.add_argument("topic", help="Topic query (e.g. 'rust async' or 'rust, sqlite')")
+    p_pulse.add_argument("--days", type=int, default=30, help="Lookback window in days (default: 30)")
+    p_pulse.add_argument("--limit", type=int, default=50, help="Maximum timeline stories to return")
+    p_pulse.add_argument("--json", action="store_true", help="Output structured JSON")
 
     # hn-archive
     p_hn_arch = subparsers.add_parser(
