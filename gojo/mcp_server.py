@@ -16,6 +16,7 @@ from .agent_tools import (
     format_search_for_agent,
     format_summary_for_agent,
     tool_briefing_hn,
+    tool_get_artifact,
     tool_get_hn_story,
     tool_search_archive,
     tool_search_hn,
@@ -49,9 +50,18 @@ def create_mcp_server(
     - hn_briefing
     - hn_get_story
     - hn_search_archive
+    - hn_get_artifact
     """
     FastMCP = _import_fastmcp()
     mcp = FastMCP(name)
+
+    shared_service: GojoHNService | None = None
+
+    def _get_service() -> GojoHNService:
+        nonlocal shared_service
+        if shared_service is None:
+            shared_service = service_factory()
+        return shared_service
 
     @mcp.tool()
     async def hn_search(
@@ -61,14 +71,11 @@ def create_mcp_server(
         focus: str | None = None,
     ) -> str:
         """Browse or search Hacker News feeds ('hn_top', 'hn_new', 'hn_best', 'hn_ask', 'hn_show')."""
-        svc = service_factory()
-        try:
-            res = await tool_search_hn(
-                svc, feed_id=feed_id, page=page, query=query, focus=focus
-            )
-            return format_search_for_agent(res)
-        finally:
-            await svc.close()
+        svc = _get_service()
+        res = await tool_search_hn(
+            svc, feed_id=feed_id, page=page, query=query, focus=focus
+        )
+        return format_search_for_agent(res)
 
     @mcp.tool()
     async def hn_summarize(
@@ -78,18 +85,15 @@ def create_mcp_server(
         include_comments: bool = True,
     ) -> str:
         """Fetch full article and generate an anti-slop technical summary with community discussion synthesis."""
-        svc = service_factory()
-        try:
-            res = await tool_summarize_hn(
-                svc,
-                external_id=external_id,
-                summary_type=summary_type,
-                locale=locale,
-                include_comments=include_comments,
-            )
-            return format_summary_for_agent(res)
-        finally:
-            await svc.close()
+        svc = _get_service()
+        res = await tool_summarize_hn(
+            svc,
+            external_id=external_id,
+            summary_type=summary_type,
+            locale=locale,
+            include_comments=include_comments,
+        )
+        return format_summary_for_agent(res)
 
     @mcp.tool()
     async def hn_briefing(
@@ -100,41 +104,41 @@ def create_mcp_server(
         since_last: bool = False,
     ) -> str:
         """Generate a synthesized executive technology briefing from Hacker News stories."""
-        svc = service_factory()
-        try:
-            res = await tool_briefing_hn(
-                svc,
-                feed_id=feed_id,
-                limit=limit,
-                locale=locale,
-                focus=focus,
-                since_last=since_last,
-            )
-            return str(res["briefing_markdown"])
-        finally:
-            await svc.close()
+        svc = _get_service()
+        res = await tool_briefing_hn(
+            svc,
+            feed_id=feed_id,
+            limit=limit,
+            locale=locale,
+            focus=focus,
+            since_last=since_last,
+        )
+        return str(res["briefing_markdown"])
 
     @mcp.tool()
     async def hn_get_story(external_id: str) -> str:
         """Fetch raw submission metadata (score, author, URL, comments count) for a Hacker News story."""
-        svc = service_factory()
-        try:
-            story = await tool_get_hn_story(svc, external_id=external_id)
-            if story is None:
-                return json.dumps({"error": f"Story '{external_id}' not found."})
-            return json.dumps(story, indent=2, ensure_ascii=False)
-        finally:
-            await svc.close()
+        svc = _get_service()
+        story = await tool_get_hn_story(svc, external_id=external_id)
+        if story is None:
+            return json.dumps({"error": f"Story '{external_id}' not found."})
+        return json.dumps(story, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     async def hn_search_archive(query: str, limit: int = 10) -> str:
         """Search locally cached Hacker News summaries via SQLite FTS5."""
-        svc = service_factory()
-        try:
-            res = await tool_search_archive(svc, query=query, limit=limit)
-            return format_archive_search_for_agent(res)
-        finally:
-            await svc.close()
+        svc = _get_service()
+        res = await tool_search_archive(svc, query=query, limit=limit)
+        return format_archive_search_for_agent(res)
+
+    @mcp.tool()
+    async def hn_get_artifact(artifact_id: str) -> str:
+        """Retrieve an existing cached summary artifact by its UUID."""
+        svc = _get_service()
+        artifact = await tool_get_artifact(svc, artifact_id=artifact_id)
+        if artifact is None:
+            return json.dumps({"error": f"Artifact '{artifact_id}' not found."})
+        return json.dumps(artifact, indent=2, ensure_ascii=False)
 
     return mcp
 

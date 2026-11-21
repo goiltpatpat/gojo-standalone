@@ -119,7 +119,7 @@ async def test_sqlite_upsert_refreshes_metadata(tmp_db_path: str) -> None:
         model_version="v1",
         created_at=t1,
     )
-    await storage.save_artifact(first)
+    s1 = await storage.save_artifact(first)
 
     updated = DigestArtifact(
         fingerprint=fp,
@@ -134,7 +134,14 @@ async def test_sqlite_upsert_refreshes_metadata(tmp_db_path: str) -> None:
         model_version="v2",
         created_at=t2,
     )
-    await storage.save_artifact(updated)
+    assert updated.id != s1.id
+    s2 = await storage.save_artifact(updated)
+    assert s2.id == s1.id
+
+    by_id = await storage.get_artifact_by_id(s2.id)
+    assert by_id is not None
+    assert by_id.id == s1.id
+    assert by_id.summary_markdown == "Regenerated deep dive on io_uring zero-copy."
 
     fetched = await storage.get_artifact_by_fingerprint(fp)
     assert fetched is not None
