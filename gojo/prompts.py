@@ -37,9 +37,11 @@ def build_digest_system_prompt(
     
     discussion_sections = (
         "### Community consensus\n"
-        "(what engineers in comments agreed on, challenged, debunked, or practical experiences shared)\n"
+        "(Separate **Consensus** — what engineers agreed on or corroborated from real-world experience — "
+        "from **Contrarian / Debunked** — claims challenged, caveats raised, or benchmarks disputed. "
+        "Anchor key points with thread-path and handle citations like `[1] @handle` or `[1.2] @handle` when comments are provided.)\n"
         "### Alternative solutions\n"
-        "(prior art, alternative tools, or libraries mentioned in discussion, if any)\n"
+        "(prior art, alternative tools, or libraries mentioned in discussion, anchored with `[path] @handle` if any)\n"
         if include_discussion
         else ""
     )

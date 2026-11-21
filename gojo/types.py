@@ -29,6 +29,12 @@ class DigestFeedItem(BaseModel):
     time: int | None = None
     type: str | None = None
     descendants: int | None = None
+    velocity: float | None = None
+    debate_ratio: float | None = None
+    signal_badges: list[str] = Field(default_factory=list)
+
+
+FeedItem = DigestFeedItem
 
 
 class DigestArtifact(BaseModel):
