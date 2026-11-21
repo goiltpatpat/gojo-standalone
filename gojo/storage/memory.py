@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from ..types import DigestArtifact, DigestFeedItem
-from .base import StorageBackend
+from .base import StorageBackend, build_topic_timeline, parse_topic_clauses
 
 
 class MemoryStorage(StorageBackend):
@@ -120,6 +120,8 @@ class MemoryStorage(StorageBackend):
                 "score": item.score,
                 "descendants": item.descendants,
                 "seen_at": now_iso,
+                "title": item.title or "",
+                "url": item.url or "",
             }
             self._snapshots.setdefault(ext_id, []).append(snap)
         return len(items)
@@ -143,3 +145,51 @@ class MemoryStorage(StorageBackend):
                     "feed_id": latest["feed_id"],
                 }
         return result
+
+    async def get_topic_timeline(
+        self, topic: str, *, days: int = 30, limit: int = 50
+    ) -> dict[str, Any]:
+        clauses = parse_topic_clauses(topic)
+        window_days = max(0, int(days))
+        if not clauses or window_days <= 0 or limit <= 0:
+            return build_topic_timeline(topic, window_days, max(0, int(limit)), [], [])
+
+        now = datetime.now(timezone.utc)
+        all_snapshots: list[dict[str, Any]] = []
+        for history in self._snapshots.values():
+            all_snapshots.extend(history)
+
+        art_limit = min(limit, 15)
+        if len(clauses) == 1:
+            artifacts = await self.search_artifacts(topic, limit=art_limit)
+        else:
+            seen_ids: set[str] = set()
+            artifacts = []
+            for clause in clauses:
+                hits = await self.search_artifacts(" ".join(clause), limit=art_limit)
+                for art in hits:
+                    if art.id not in seen_ids:
+                        seen_ids.add(art.id)
+                        artifacts.append(art)
+                        if len(artifacts) >= art_limit:
+                            break
+                if len(artifacts) >= art_limit:
+                    break
+
+        return build_topic_timeline(
+            topic, window_days, limit, all_snapshots, artifacts, now=now
+        )
+
+    async def get_recent_interest_corpus(self, *, limit: int = 40) -> list[dict[str, str]]:
+        if limit <= 0:
+            return []
+        recent = list(reversed(list(self._artifacts_by_id.values())))[:limit]
+        return [
+            {
+                "title": art.title or "",
+                "key_takeaway": str(art.summary_extra.get("key_takeaway") or ""),
+                "source_url": art.source_url or "",
+                "created_at": art.created_at.isoformat() if art.created_at else "",
+            }
+            for art in recent
+        ]
