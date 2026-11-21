@@ -422,3 +422,158 @@ async def test_service_jina_reader_blocks_private_urls_directly() -> None:
         assert await svc._fetch_via_jina_reader("http://10.0.0.1/internal") == ""
         mock_fetch.assert_not_called()
     await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_service_async_context_manager_closes_on_exit() -> None:
+    mock_source = AsyncMock()
+    mock_algolia = AsyncMock()
+    mock_llm = AsyncMock()
+
+    async with GojoHNService(
+        feed_source=mock_source,
+        algolia_provider=mock_algolia,
+        storage=MemoryStorage(),
+        llm_provider=mock_llm,
+    ) as svc:
+        client = await svc._article_client()
+        assert not client.is_closed
+
+    assert client.is_closed
+    mock_source.close.assert_awaited_once()
+    mock_algolia.close.assert_awaited_once()
+    mock_llm.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_radar_dedup_signals_badges_focus_and_clusters() -> None:
+    storage = MemoryStorage()
+    now = datetime.now(timezone.utc)
+    recent_ts = int((now - timedelta(minutes=30)).timestamp())
+
+    story_a = DigestFeedItem(
+        feed_provider="hn",
+        external_id="1001",
+        title="Rust Kernel Driver Framework Released",
+        url="https://example.com/rust-kernel",
+        score=280,
+        descendants=240,
+        time=recent_ts,
+        published_at=now - timedelta(minutes=30),
+    )
+    story_a_dup = DigestFeedItem(
+        feed_provider="hn",
+        external_id="1002",
+        title="Rust Kernel Driver Framework Released",
+        url="https://example.com/rust-kernel?utm_source=hn",
+        score=210,
+        descendants=190,
+        time=recent_ts,
+        published_at=now - timedelta(minutes=30),
+    )
+    story_b = DigestFeedItem(
+        feed_provider="hn",
+        external_id="1003",
+        title="Sourdough Baking Tips for Beginners",
+        url="https://example.com/bread",
+        score=12,
+        descendants=2,
+        time=recent_ts,
+        published_at=now - timedelta(minutes=30),
+    )
+
+    mock_source = AsyncMock()
+    mock_source.provider_id = "hn"
+
+    async def fake_list_page(feed_variant: str, page: int, page_size: int):
+        if feed_variant == "top":
+            return [story_a, story_b], False
+        if feed_variant == "best":
+            # story_a repeated across feeds + story_a_dup same canonical URL
+            return [story_a, story_a_dup], False
+        return [], False
+
+    mock_source.list_page.side_effect = fake_list_page
+    mock_llm = AsyncMock()
+
+    async with GojoHNService(
+        feed_source=mock_source,
+        storage=storage,
+        llm_provider=mock_llm,
+    ) as svc:
+        res = await svc.radar(
+            feeds=["hn_top", "hn_best"],
+            limit_per_feed=10,
+            top_n=5,
+            focus="rust kernel",
+            badges=["breakout", "high-debate"],
+        )
+
+    assert res["feeds_scanned"] == ["hn_top", "hn_best"]
+    assert res["total_scanned"] == 3  # 1001, 1003, 1002 (deduped 1001)
+    assert res["focus_applied"] == "rust kernel"
+    assert res["badges_filter"] == ["breakout", "high-debate"]
+    # story_b filtered out by badges; 1001 and 1002 remain and cluster together via canonical URL
+    assert len(res["top_items"]) == 2
+    assert res["top_items"][0]["external_id"] in {"1001", "1002"}
+    assert res["top_items"][0]["velocity"] is not None
+    assert "breakout" in res["top_items"][0]["signal_badges"]
+    assert len(res["clusters"]) == 1
+    assert res["clusters"][0]["size"] == 2
+    # Zero LLM tokens used
+    mock_llm.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_deep_dive_concurrent_cache_and_partial_errors() -> None:
+    storage = MemoryStorage()
+    mock_source = AsyncMock()
+    mock_source.provider_id = "hn"
+
+    async def fake_get_item(external_id: str):
+        if external_id == "201":
+            return {"id": 201, "title": "SQLite WAL Architecture", "text": "WAL details."}
+        if external_id == "202":
+            return {"id": 202, "title": "SQLite FTS5 Benchmarks", "text": "FTS5 details."}
+        return None  # 203 triggers ValueError inside summarize
+
+    mock_source.get_item.side_effect = fake_get_item
+
+    mock_algolia = AsyncMock()
+    mock_algolia.fetch_discussion_context.return_value = "[1] @alice: Great insight."
+    mock_algolia.search_stories.return_value = [
+        DigestFeedItem(feed_provider="hn", external_id="201", title="SQLite WAL Architecture", score=300),
+        DigestFeedItem(feed_provider="hn", external_id="202", title="SQLite FTS5 Benchmarks", score=250),
+        DigestFeedItem(feed_provider="hn", external_id="203", title="Missing Story", score=50),
+    ]
+
+    async def fake_summarizer(**kwargs):
+        return "## Summary\nTechnical breakdown.\n\n### Key takeaway\nSQLite is fast."
+
+    async with GojoHNService(
+        feed_source=mock_source,
+        algolia_provider=mock_algolia,
+        storage=storage,
+        custom_summarizer=fake_summarizer,
+    ) as svc:
+        # Pre-warm cache for story 201 to verify cached_hits tracking & local_archive_matches
+        await svc.summarize(external_id="201", summary_type="technical", locale="en")
+
+        dossier = await svc.deep_dive(
+            topic="SQLite",
+            max_stories=3,
+            summary_type="technical",
+            locale="en",
+            include_comments=True,
+        )
+
+        with pytest.raises(ValueError, match="non-empty"):
+            await svc.deep_dive(topic="   ")
+
+    assert dossier["topic"] == "SQLite"
+    assert dossier["stories_analyzed"] == 2
+    assert dossier["cached_hits"] == 1
+    assert len(dossier["summaries"]) == 2
+    assert len(dossier["local_archive_matches"]) >= 1
+    assert len(dossier["errors"]) == 1
+    assert dossier["errors"][0]["external_id"] == "203"

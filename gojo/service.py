@@ -201,6 +201,12 @@ class GojoHNService:
             )
         return self._article_http
 
+    async def __aenter__(self) -> GojoHNService:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
     async def close(self) -> None:
         """Close all open HTTP client connections across article fetcher, feeds, Algolia, and LLM."""
         if self._article_http is not None and not self._article_http.is_closed:
@@ -308,6 +314,10 @@ class GojoHNService:
             feed_refreshed_at=now,
             list_cache_ttl_seconds=LIST_CACHE_TTL_S,
         )
+
+    async def list_recent_artifacts(self, limit: int = 20) -> list[DigestArtifact]:
+        """List recently summarized digest artifacts (newest first)."""
+        return await self.storage.list_recent_artifacts(limit=limit)
 
     async def search_archive(self, query: str, limit: int = 10) -> list[DigestArtifact]:
         """Search locally cached/summarized digest artifacts using storage FTS5 / text search."""
@@ -846,3 +856,206 @@ class GojoHNService:
             model=requested_model,
             max_tokens=4096,
         )
+
+    async def radar(
+        self,
+        *,
+        feeds: list[str] | None = None,
+        limit_per_feed: int = 20,
+        top_n: int = 10,
+        focus: str | None = None,
+        badges: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Zero-LLM-token Six Eyes Signal Radar:
+        Concurrently scans one or more HN feeds, deduplicates stories, ensures signals are
+        computed, optionally filters by signal badges and re-ranks by BM25 focus, clusters
+        related stories, and returns a structured signal radar payload.
+        """
+        raw_feeds = feeds if feeds else ["hn_top", "hn_best"]
+        target_feeds: list[str] = []
+        seen_feeds: set[str] = set()
+        for f in raw_feeds:
+            fid = str(f).strip()
+            if fid and fid not in seen_feeds:
+                seen_feeds.add(fid)
+                target_feeds.append(fid)
+        if not target_feeds:
+            target_feeds = ["hn_top", "hn_best"]
+
+        limit_per_feed = max(1, int(limit_per_feed))
+        top_n = max(1, int(top_n))
+
+        feed_responses = await asyncio.gather(
+            *(
+                self.list_feed(feed_id=fid, page=1, page_size=limit_per_feed)
+                for fid in target_feeds
+            )
+        )
+
+        deduped: list[DigestFeedItem] = []
+        seen_ids: set[str] = set()
+        for resp in feed_responses:
+            for item in resp.items:
+                ext_id = str(item.external_id)
+                if ext_id in seen_ids:
+                    continue
+                seen_ids.add(ext_id)
+                deduped.append(item)
+
+        total_scanned = len(deduped)
+
+        # Ensure signals (velocity, debate_ratio, signal_badges) are populated
+        items: list[DigestFeedItem] = []
+        for item in deduped:
+            if item.velocity is None or item.debate_ratio is None:
+                items.extend(enrich_items_with_signals([item]))
+            else:
+                items.append(item)
+
+        badges_filter = [
+            b.strip().lower() for b in (badges or []) if isinstance(b, str) and b.strip()
+        ]
+        if badges_filter:
+            badge_set = set(badges_filter)
+            items = [
+                it
+                for it in items
+                if any(b.lower() in badge_set for b in (it.signal_badges or []))
+            ]
+
+        focus_clean = focus.strip() if isinstance(focus, str) and focus.strip() else None
+        if focus_clean and items:
+            ranked = rank_items_by_focus(items, focus_clean)
+            items = [it for it, _score in ranked]
+        elif items:
+            items.sort(
+                key=lambda it: (
+                    1 if (it.signal_badges or []) else 0,
+                    float(it.velocity or 0.0),
+                    int(it.score or 0),
+                ),
+                reverse=True,
+            )
+
+        top_items = items[:top_n]
+        raw_clusters = cluster_related_stories(top_items)
+        clusters = [
+            {
+                "cluster_id": idx,
+                "size": len(cluster),
+                "lead_external_id": cluster[0].external_id,
+                "lead_title": cluster[0].title,
+                "items": [it.model_dump(mode="json") for it in cluster],
+            }
+            for idx, cluster in enumerate(raw_clusters, start=1)
+        ]
+
+        return {
+            "feeds_scanned": target_feeds,
+            "total_scanned": total_scanned,
+            "clusters": clusters,
+            "top_items": [it.model_dump(mode="json") for it in top_items],
+            "focus_applied": focus_clean,
+            "badges_filter": badges_filter,
+        }
+
+    async def deep_dive(
+        self,
+        *,
+        topic: str,
+        max_stories: int = 3,
+        summary_type: str = "technical",
+        locale: str = "en",
+        include_comments: bool = True,
+        sort_by: str = "relevance",
+    ) -> dict[str, Any]:
+        """
+        Compound research pipeline:
+        Concurrently searches both the local FTS5 archive and the full HN Algolia archive,
+        selects up to `max_stories` distinct high-signal stories, summarizes them concurrently
+        (automatically leveraging deterministic SHA-256 cache), and returns a research dossier.
+        """
+        topic_clean = (topic or "").strip()
+        if not topic_clean:
+            raise ValueError("topic must be a non-empty string.")
+
+        max_stories = max(1, int(max_stories))
+        errors: list[dict[str, str]] = []
+
+        local_res, algolia_res = await asyncio.gather(
+            self.search_archive(topic_clean, limit=max_stories * 2),
+            self.search_hn_archive(
+                topic_clean, limit=max(max_stories * 3, 10), sort_by=sort_by
+            ),
+            return_exceptions=True,
+        )
+
+        local_matches: list[DigestArtifact] = []
+        if isinstance(local_res, BaseException):
+            errors.append({"stage": "local_archive", "error": str(local_res)})
+        else:
+            local_matches = list(local_res)
+
+        hn_hits: list[DigestFeedItem] = []
+        if isinstance(algolia_res, BaseException):
+            errors.append({"stage": "hn_archive", "error": str(algolia_res)})
+        else:
+            hn_hits = list(algolia_res)
+
+        # Select up to max_stories distinct story IDs, prioritizing Algolia hits then local archive
+        selected_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for hit in hn_hits:
+            ext_id = str(hit.external_id)
+            if ext_id and ext_id not in seen_ids:
+                seen_ids.add(ext_id)
+                selected_ids.append(ext_id)
+                if len(selected_ids) >= max_stories:
+                    break
+
+        if len(selected_ids) < max_stories:
+            for art in local_matches:
+                ext_id = str(art.external_id)
+                if ext_id and ext_id not in seen_ids:
+                    seen_ids.add(ext_id)
+                    selected_ids.append(ext_id)
+                    if len(selected_ids) >= max_stories:
+                        break
+
+        summary_results = await asyncio.gather(
+            *(
+                self.summarize(
+                    external_id=story_id,
+                    summary_type=summary_type,
+                    locale=locale,
+                    include_comments=include_comments,
+                )
+                for story_id in selected_ids
+            ),
+            return_exceptions=True,
+        )
+
+        summaries: list[dict[str, Any]] = []
+        cached_hits = 0
+        for story_id, res in zip(selected_ids, summary_results):
+            if isinstance(res, BaseException):
+                errors.append({"external_id": story_id, "error": str(res)})
+                continue
+            if res.completion.status == "cached":
+                cached_hits += 1
+            summaries.append(
+                {
+                    "artifact": res.artifact.model_dump(mode="json"),
+                    "completion": res.completion.model_dump(mode="json"),
+                }
+            )
+
+        return {
+            "topic": topic_clean,
+            "stories_analyzed": len(summaries),
+            "cached_hits": cached_hits,
+            "summaries": summaries,
+            "local_archive_matches": [art.model_dump(mode="json") for art in local_matches],
+            "errors": errors,
+        }
